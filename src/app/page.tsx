@@ -15,7 +15,6 @@ import {
   Connection,
   PublicKey,
   ParsedAccountData,
-  ParsedAccountInfo,
   AccountInfo,
 } from '@solana/web3.js';
 import { useWallet } from '@solana/wallet-adapter-react';
@@ -54,17 +53,16 @@ function fmt(n: number, dp = 6) {
  */
 async function getMintDecimals(connection: Connection, mintPk: PublicKey): Promise<number> {
   const info = await connection.getParsedAccountInfo(mintPk);
-  const v = info.value as (ParsedAccountInfo<ParsedAccountData> | AccountInfo<Buffer> | null);
-  if (v && 'data' in v) {
-    const data = v.data;
-    if (typeof (data as any) === 'object' && (data as ParsedAccountData).parsed) {
-      const parsed = (data as ParsedAccountData).parsed as any;
-      const dec = parsed?.info?.decimals;
-      if (typeof dec === 'number') return dec;
-    }
+  const v = info.value as AccountInfo<Buffer | ParsedAccountData> | null;
+
+  if (v && typeof v.data === 'object' && (v.data as ParsedAccountData).parsed) {
+    const parsed = (v.data as ParsedAccountData).parsed as any;
+    const dec = parsed?.info?.decimals;
+    if (typeof dec === 'number') return dec;
   }
   return 9;
 }
+
 
 /* ============
    Global CSS
@@ -329,10 +327,7 @@ function SwapScreen({ connection }: { connection: Connection }) {
         const data = acct.account.data as unknown;
         let uiAmount: number | null = null;
         if (
-          typeof data === 'object' &&
-          data !== null &&
-          (data as ParsedAccountData).parsed &&
-          (data as ParsedAccountData).program === 'spl-token'
+          typeof data === 'object' && (data as ParsedAccountData).parsed
         ) {
           const parsed = (data as ParsedAccountData).parsed as any;
           const maybe = parsed?.info?.tokenAmount?.uiAmount;
