@@ -1,0 +1,756 @@
+'use client';
+
+import dynamic from 'next/dynamic';
+import type React from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import JSBI from 'jsbi';
+import { Connection, PublicKey } from '@solana/web3.js';
+import { useWallet } from '@solana/wallet-adapter-react';
+import { JupiterProvider, useJupiter } from '@jup-ag/react-hook';
+
+/* =========================
+   Client-only wallet button
+   ========================= */
+const WalletButton = dynamic(
+  async () => (await import('@solana/wallet-adapter-react-ui')).WalletMultiButton,
+  { ssr: false }
+);
+
+/* =========
+   ENV VARS
+   ========= */
+const RPC   = process.env.NEXT_PUBLIC_RPC_URL!;
+const WS    = process.env.NEXT_PUBLIC_WS_URL;
+const TROLL = process.env.NEXT_PUBLIC_TROLL_MINT!;     // 6VaiLPR5VouK91oFbZigfSU6Gu7A4aRToTXNb7R6ZVjB
+const SOL   = process.env.NEXT_PUBLIC_SOL_MINT!;       // So11111111111111111111111111111111111111112
+
+/* ===================
+   Helpers & Constants
+   =================== */
+const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+const SOL_FEE_BUFFER = 0.0005;
+
+function clamp(n: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, n));
+}
+function fmt(n: number, dp = 6) {
+  return Number.isFinite(n) ? n.toFixed(dp) : '0';
+}
+async function getMintDecimals(connection: Connection, mintPk: PublicKey): Promise<number> {
+  const info = await connection.getParsedAccountInfo(mintPk);
+  const decimals = (info.value as any)?.data?.parsed?.info?.decimals;
+  return typeof decimals === 'number' ? decimals : 9;
+}
+
+/* ============
+   Global CSS
+   ============ */
+function GlobalStyles() {
+  return (
+    <style jsx global>{`
+      :root{
+        --brand: #29ffc6;
+        --brand-strong: #00ffd5;
+      }
+      @keyframes ripple-kf { to { transform: scale(12); opacity: 0; } }
+      .ripple-btn { position: relative; overflow: hidden; isolation: isolate; }
+      .ripple-span {
+        position: absolute; border-radius: 999px; background: var(--brand);
+        opacity: 0.35; transform: scale(0); pointer-events: none; animation: ripple-kf 600ms linear forwards;
+      }
+      .brand-aura { position: relative; }
+      .brand-aura::after {
+        content: ""; position: absolute; inset: -10px; border-radius: 24px;
+        background:
+          radial-gradient(40% 60% at 30% 30%, var(--brand)15%, transparent 60%),
+          radial-gradient(50% 60% at 70% 70%, var(--brand-strong)10%, transparent 60%);
+        filter: blur(18px); opacity: 0.45; animation: brandPulse 2.6s ease-in-out infinite alternate; z-index: -1;
+      }
+      @keyframes brandPulse { from { opacity: 0.25; } to { opacity: 0.55; } }
+      .responsive-image { width:100%; height:auto; display:block; border-radius:8px; box-shadow:0 4px 8px rgba(0,0,0,0.1); }
+
+      /* ---------- Layout shells ---------- */
+      .shell {
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 16px;
+        background:
+          radial-gradient(1200px 600px at 10% 10%, #0ff2, transparent 60%),
+          radial-gradient(1200px 600px at 90% 20%, #f0f2, transparent 60%),
+          linear-gradient(135deg,#0b1220,#0f0f17 40%,#0b0b0f);
+      }
+      .panel {
+        width: 100%;
+        max-width: 760px;
+        border-radius: 24px;
+        padding: 24px;
+        backdrop-filter: blur(10px);
+        background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.02));
+        border: 1px solid rgba(255,255,255,0.08);
+        box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+      }
+      .header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 16px;
+      }
+      .header-left {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        min-width: 0;
+      }
+      .balances {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+        margin-bottom: 16px;
+      }
+      .buy-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 16px;
+        flex-wrap: wrap;
+      }
+      .actions {
+        display: flex;
+        gap: 12px;
+        margin-top: 16px;
+      }
+
+      /* ---------- Mobile tweaks ---------- */
+      @media (max-width: 700px) {
+        .panel { padding: 16px; border-radius: 18px; }
+        .balances { grid-template-columns: 1fr; }
+      }
+      @media (max-width: 560px) {
+        .header { flex-direction: column; align-items: stretch; gap: 10px; }
+        .actions { flex-direction: column; }
+        .actions > * { width: 100% !important; }
+        .buy-row { flex-direction: column; align-items: stretch; }
+        .buy-row button { width: 100%; }
+      }
+      @keyframes floaty { 0%{transform:translateY(0)} 50%{transform:translateY(-4px)} 100%{transform:translateY(0)} }
+      @keyframes spinSlow { from{transform:rotate(0)} to{transform:rotate(360deg)} }
+      .logoWrap{
+        width: 52px; height: 52px; border-radius: 14px; overflow: hidden;
+        border: 1px solid rgba(255,255,255,0.12);
+        background: radial-gradient(60% 60% at 40% 30%, #2a2a2a, #171717 70%);
+        position: relative; animation: floaty 6s ease-in-out infinite; transition: transform .3s ease;
+      }
+      .logoAura::after{
+        content:""; position:absolute; inset:-6px; border-radius:16px; pointer-events:none;
+        border: 1px solid rgba(255,255,255,0.12);
+        box-shadow: 0 0 22px var(--brand), 0 0 6px rgba(0,0,0,0.35) inset;
+        animation: logoGlow 2.1s ease-in-out infinite alternate;
+      }
+      @keyframes logoGlow {
+        from { box-shadow: 0 0 10px var(--brand), 0 0 2px rgba(0,0,0,0.35) inset }
+        to   { box-shadow: 0 0 24px var(--brand-strong), 0 0 6px rgba(0,0,0,0.35) inset }
+      }
+      .logoImg{ width:100%; height:100%; object-fit:cover; display:block; }
+      .logoWrap:hover .logoImg{ animation: spinSlow 12s linear infinite; }
+    `}</style>
+  );
+}
+
+/* =========
+   Components
+   ========= */
+function Logo() { return <div className="logoWrap logoAura"><img src="/troll.png" alt="Troll Logo" className="logoImg"
+  onError={(e) => { const t=e.currentTarget; t.style.display='none'; const fb=document.createElement('div'); fb.textContent='T';
+    fb.style.cssText='width:100%;height:100%;display:grid;place-items:center;color:#9ff;font-weight:900;font-size:20px;'; t.parentElement?.appendChild(fb); }} /></div>; }
+
+type RBProps = React.ButtonHTMLAttributes<HTMLButtonElement>;
+function RippleButton({ children, onClick, style, disabled, className, ...rest }: RBProps) {
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const doClick = (e: React.MouseEvent<HTMLButtonElement>) => {
+    const btn = btnRef.current;
+    if (btn) {
+      const rect = btn.getBoundingClientRect();
+      const size = Math.max(rect.width, rect.height);
+      const x = e.clientX - rect.left - size / 2;
+      const y = e.clientY - rect.top - size / 2;
+      const span = document.createElement('span');
+      span.className = 'ripple-span';
+      span.style.width = span.style.height = `${size}px`;
+      span.style.left = `${x}px`; span.style.top = `${y}px`;
+      btn.appendChild(span);
+      span.addEventListener('animationend', () => span.remove());
+    }
+    onClick?.(e);
+  };
+  return (
+    <button
+      ref={btnRef}
+      className={`ripple-btn ${className || ''}`}
+      onClick={doClick}
+      style={style}
+      disabled={disabled}
+      {...rest}
+    >
+      {children}
+    </button>
+  );
+}
+
+function Row({ children, style }: { children: React.ReactNode; style?: React.CSSProperties }) {
+  return <div style={{ display: 'flex', gap: 10, alignItems: 'center', justifyContent: 'space-between', ...style }}>{children}</div>;
+}
+
+function BalanceCard({
+  label, value, sub, badge, gradient,
+}: {
+  label: string; value: string; sub?: string; badge: string; gradient: string;
+}) {
+  return (
+    <div style={{
+      borderRadius: 16,
+      padding: 14,
+      background: 'rgba(0,0,0,0.35)',
+      border: '1px solid rgba(255,255,255,0.08)',
+      position: 'relative',
+      overflow: 'hidden'
+    }}>
+      <div style={{ position: 'absolute', inset: 0, opacity: 0.35, background: gradient, filter: 'blur(50px)' }} />
+      <div style={{ position: 'relative' }}>
+        <div style={{ color: '#9ad', fontSize: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
+          <span>{label}</span>
+          <span style={{
+            fontSize: 10, padding: '2px 6px', borderRadius: 999,
+            background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.12)'
+          }}>{badge}</span>
+        </div>
+        <div style={{ color: '#fff', fontSize: 22, fontWeight: 800, marginTop: 4 }}>{value}</div>
+        {sub && <div style={{ color: 'rgba(255,255,255,0.7)', fontSize: 12, marginTop: 2 }}>{sub}</div>}
+      </div>
+    </div>
+  );
+}
+
+/* ==============
+   Default export
+   ============== */
+export default function Page() {
+  const connection = useMemo(
+    () => new Connection(RPC, { wsEndpoint: WS || undefined, commitment: 'processed' }),
+    []
+  );
+  return (
+    <>
+      <GlobalStyles />
+      <JupiterProvider connection={connection}>
+        <SwapScreen connection={connection} />
+      </JupiterProvider>
+    </>
+  );
+}
+
+/* ==========
+   Main view
+   ========== */
+function SwapScreen({ connection }: { connection: Connection }) {
+  const { publicKey, sendTransaction, connected } = useWallet();
+
+  // SSR guard for wallet UI
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
+  // Token selection
+  const [inMintStr, setInMintStr]   = useState<string>(SOL);
+  const [outMintStr, setOutMintStr] = useState<string>(TROLL);
+
+  const inputMint  = useMemo(() => new PublicKey(inMintStr),  [inMintStr]);
+  const outputMint = useMemo(() => new PublicKey(outMintStr), [outMintStr]);
+  const trollPk    = useMemo(() => new PublicKey(TROLL), []);
+
+  // Amount / slider
+  const [amountStr, setAmountStr] = useState<string>('0.1');
+  const [percent, setPercent]     = useState<number>(0);
+
+  // Decimals + balances
+  const [inputDecimals, setInputDecimals] = useState<number>(9);
+  const [solBalance, setSolBalance]       = useState<number>(0);
+  const [trollBalance, setTrollBalance]   = useState<number>(0);
+  const [trollDecimals, setTrollDecimals] = useState<number>(9);
+
+  // USD prices
+  const [solUsd, setSolUsd]       = useState<number | null>(null);
+  const [trollUsd, setTrollUsd]   = useState<number | null>(null);
+
+  // Discovered TROLL token account (not just ATA)
+  const trollAcctRef = useRef<PublicKey | null>(null);
+
+  // --- Buying block (Pesapal link + address chip)
+  const [copied, setCopied] = useState(false);
+  const addressStr = publicKey?.toBase58() ?? '';
+  const pesapalUrl = useMemo(() => {
+    const base = 'https://store.pesapal.com/solanapurchase';
+    if (!addressStr) return base;
+    const u = new URL(base);
+    u.searchParams.set('address', addressStr);
+    return u.toString();
+  }, [addressStr]);
+
+  function copyAddr() {
+    if (!addressStr) return;
+    navigator.clipboard.writeText(addressStr).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    });
+  }
+
+  // Balances refresher (robust)
+  const refreshBalances = useCallback(async () => {
+    if (!publicKey) {
+      setSolBalance(0); setTrollBalance(0); trollAcctRef.current = null;
+      return;
+    }
+    try {
+      // SOL
+      const lamports = await connection.getBalance(publicKey, 'processed');
+      setSolBalance(lamports / 1e9);
+
+      // TROLL decimals
+      const dec = await getMintDecimals(connection, trollPk);
+      setTrollDecimals(dec);
+
+      // Any token account for TROLL
+      const resp = await connection.getTokenAccountsByOwner(
+        publicKey,
+        { mint: trollPk },
+        { commitment: 'processed' }
+      );
+
+      if (resp.value.length > 0) {
+        const acct = resp.value[0];
+        trollAcctRef.current = acct.pubkey;
+        const parsed = (acct.account.data as any)?.parsed;
+        const ui = parsed?.info?.tokenAmount?.uiAmount ?? null;
+        if (ui !== null) setTrollBalance(ui);
+        else {
+          const bal = await connection.getTokenAccountBalance(acct.pubkey).catch(() => null);
+          setTrollBalance(bal?.value?.uiAmount ?? 0);
+        }
+      } else {
+        trollAcctRef.current = null;
+        setTrollBalance(0);
+      }
+    } catch (e) {
+      console.warn('[balance]', e);
+    }
+  }, [connection, publicKey, trollPk]);
+
+  // Background polling (10s)
+  useEffect(() => {
+    refreshBalances();
+    const id = setInterval(refreshBalances, 10000);
+    return () => clearInterval(id);
+  }, [refreshBalances]);
+
+  // USD prices via Jupiter Price API (refresh every 30s)
+  useEffect(() => {
+    let stop = false;
+    async function loadPrices() {
+      try {
+        const u = new URL('https://price.jup.ag/v6/price');
+        u.searchParams.set('ids', `SOL,${TROLL}`);
+        const r = await fetch(u.toString(), { cache: 'no-store' });
+        const json = await r.json();
+        if (!stop) {
+          const sol = json?.data?.SOL?.price ?? null;
+          const troll = json?.data?.[TROLL]?.price ?? null;
+          setSolUsd(typeof sol === 'number' ? sol : null);
+          setTrollUsd(typeof troll === 'number' ? troll : null);
+        }
+      } catch {
+        if (!stop) { setSolUsd(null); setTrollUsd(null); }
+      }
+    }
+    loadPrices();
+    const id = setInterval(loadPrices, 30000);
+    return () => { stop = true; clearInterval(id); };
+  }, []);
+
+  // Optional WS subscription with fallback to fast polling (3s)
+  const fastPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  useEffect(() => {
+    if (!WS || !publicKey) return;
+    let solSubId: number | null = null;
+    let trollSubId: number | null = null;
+    let wsFailed = false;
+
+    (async () => {
+      try {
+        solSubId = await connection.onAccountChange(publicKey, () => { refreshBalances(); }, 'processed');
+        if (!trollAcctRef.current) { await refreshBalances(); }
+        if (trollAcctRef.current) {
+          trollSubId = await connection.onAccountChange(trollAcctRef.current, () => { refreshBalances(); }, 'processed');
+        }
+      } catch (e) {
+        console.warn('[ws]', e);
+        wsFailed = true;
+      }
+      if (wsFailed && fastPollRef.current === null) {
+        fastPollRef.current = setInterval(refreshBalances, 3000);
+      }
+    })();
+
+    return () => {
+      if (solSubId !== null) { try { connection.removeAccountChangeListener(solSubId); } catch {} }
+      if (trollSubId !== null) { try { connection.removeAccountChangeListener(trollSubId); } catch {} }
+      if (fastPollRef.current) { clearInterval(fastPollRef.current); fastPollRef.current = null; }
+    };
+  }, [connection, publicKey, refreshBalances]);
+
+  // Keep input decimals in sync
+  useEffect(() => {
+    (async () => {
+      if (inMintStr === SOL) setInputDecimals(9);
+      else setInputDecimals(await getMintDecimals(connection, new PublicKey(inMintStr)));
+    })();
+  }, [connection, inMintStr]);
+
+  // Immediate refresh on connect / select changes
+  useEffect(() => { refreshBalances(); }, [connected, publicKey, refreshBalances]);
+  useEffect(() => { refreshBalances(); }, [inMintStr, outMintStr, refreshBalances]);
+
+  // Slider ⇒ amount
+  useEffect(() => {
+    if (!connected) return;
+    const base = inMintStr === SOL ? Math.max(0, solBalance - SOL_FEE_BUFFER) : trollBalance;
+    const val = clamp((base * percent) / 100, 0, base);
+    const dp  = Math.min(6, inputDecimals);
+    setAmountStr(val > 0 ? String(Number(val.toFixed(dp))) : '0');
+  }, [percent, connected, inMintStr, solBalance, trollBalance, inputDecimals]);
+
+  // UI amount ⇒ atomic
+  const amountAtomic = useMemo(() => {
+    const n = Number.parseFloat(amountStr || '0');
+    const atomic = Math.floor((Number.isFinite(n) && n > 0 ? n : 0) * 10 ** inputDecimals);
+    return JSBI.BigInt(atomic.toString());
+  }, [amountStr, inputDecimals]);
+
+  // Jupiter v6
+  const { fetchQuote, quoteResponseMeta, fetchSwapTransaction, refresh, loading, error } = useJupiter({
+    amount: amountAtomic,
+    inputMint,
+    outputMint,
+    slippageBps: 50,
+  });
+
+  async function getBestRoute() { await fetchQuote(); }
+
+  async function doSwap() {
+    if (!publicKey) return alert('Connect wallet first');
+    const quote = quoteResponseMeta ?? (await fetchQuote());
+    if (!quote) return alert('No route found');
+
+    const res = await fetchSwapTransaction({
+      quoteResponseMeta: quote,
+      userPublicKey: publicKey,
+      wrapUnwrapSOL: true,
+      allowOptimizedWrappedSolTokenAccount: true,
+      prioritizationFeeLamports: 0,
+    });
+    if ('error' in res) { console.error(res.error); return alert('Failed to build swap transaction'); }
+
+    try {
+      const txid = await sendTransaction(res.swapTransaction, connection, { maxRetries: 3, skipPreflight: false });
+      alert(`Sent: ${txid}`);
+      await refresh();
+      await refreshBalances();
+    } catch (e) {
+      console.error(e);
+      alert('Swap failed to send');
+    }
+  }
+
+  function flip() {
+    setInMintStr(outMintStr);
+    setOutMintStr(inMintStr);
+    setPercent(0);
+  }
+
+  return (
+    <div className="shell">
+      <div className="panel">
+        {/* Header */}
+        <div className="header">
+          <div className="header-left">
+            <Logo />
+            <div style={{ minWidth: 0 }}>
+              <div style={{ color: '#fff', fontSize: 18, fontWeight: 700, lineHeight: 1.1 }}>Troll Swap</div>
+              <div style={{ color: 'rgba(255,255,255,0.6)', fontSize: 12 }}>SOL ↔ TROLL</div>
+            </div>
+          </div>
+          <div>{mounted ? <WalletButton /> : null}</div>
+        </div>
+
+        {/* Balances */}
+        <div className="balances">
+          <BalanceCard
+            label="SOL Balance"
+            value={fmt(solBalance, 6)}
+            sub={solUsd ? `≈ $${(solBalance * solUsd).toFixed(2)}` : '—'}
+            badge="Main"
+            gradient="linear-gradient(135deg,#1d2b64,#f8cdda)"
+          />
+          <BalanceCard
+            label="TROLL Balance"
+            value={fmt(trollBalance, Math.min(6, trollDecimals))}
+            sub={trollUsd ? `≈ $${(trollBalance * trollUsd).toFixed(2)}` : '—'}
+            badge="Token"
+            gradient="linear-gradient(135deg,#0cebeb,#29ffc6)"
+          />
+        </div>
+
+        {/* Buying SOL */}
+        <div className="buy-row">
+          {addressStr ? (
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 8,
+              padding: '8px 12px', borderRadius: 999,
+              border: '1px solid rgba(255,255,255,0.15)',
+              background: 'rgba(255,255,255,0.06)', color: '#cfe',
+              fontSize: 12, maxWidth: '100%'
+            }}>
+              <span>Copy Your Solana Address First:- </span>
+              <span style={{ fontFamily: 'monospace' }}>
+                {addressStr.slice(0, 4)}…{addressStr.slice(-4)}
+              </span>
+              <button onClick={copyAddr} type="button" style={{
+                padding: '4px 8px', borderRadius: 999, border: '1px solid rgba(255,255,255,0.15)',
+                background: 'rgba(255,255,255,0.08)', color: '#dff', fontWeight: 700, cursor: 'pointer'
+              }}>
+                {copied ? 'Copied!' : 'Copy'}
+              </button>
+            </div>
+          ) : (
+            <div style={{ color: 'rgba(255,255,255,0.7)', fontSize: 12 }}>
+              Connect your wallet so we can attach your address to the payment.
+            </div>
+          )}
+
+          <a href={pesapalUrl} target="_blank" rel="noopener noreferrer">
+            <button style={btnGhost}>GET SOLANA HERE</button>
+          </a>
+
+          <img src="/payment_methods.png" alt="Payment methods" className="responsive-image" />
+        </div>
+
+        {/* Swap card */}
+        <div className="brand-aura">
+          <div style={{
+            borderRadius: 20,
+            padding: 20,
+            border: '1px solid rgba(255,255,255,0.10)',
+            background: 'linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03))'
+          }}>
+            {/* From */}
+            <Row>
+              <label style={{ color: '#cfe' }}>From</label>
+              <select
+                value={inMintStr}
+                onChange={(e) => { setInMintStr(e.target.value); setPercent(0); }}
+                style={selectStyle}
+              >
+                <option value={SOL}>SOL</option>
+                <option value={TROLL}>TROLL</option>
+              </select>
+              <span style={hintStyle}>
+                Balance:&nbsp;
+                {inMintStr === SOL ? fmt(solBalance, 6) : fmt(trollBalance, Math.min(6, trollDecimals))}
+              </span>
+            </Row>
+
+            {/* Amount + MAX + slider + chips */}
+            <Row>
+              <input
+                value={amountStr}
+                onChange={(e) => {
+                  const v = parseFloat(e.target.value || '0');
+                  const base = inMintStr === SOL ? Math.max(0, solBalance - SOL_FEE_BUFFER) : trollBalance;
+                  const p = base > 0 ? clamp((v / base) * 100, 0, 100) : 0;
+                  setAmountStr(e.target.value);
+                  setPercent(Math.round(p));
+                }}
+                placeholder="0.1"
+                inputMode="decimal"
+                style={inputStyle}
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  const base = inMintStr === SOL ? Math.max(0, solBalance - SOL_FEE_BUFFER) : trollBalance;
+                  const dp  = Math.min(6, inputDecimals);
+                  setAmountStr(base > 0 ? String(Number(base.toFixed(dp))) : '0');
+                  setPercent(100);
+                }}
+                style={btnGhost}
+              >
+                MAX
+              </button>
+            </Row>
+
+            {/* USD hint for entered amount */}
+            {(() => {
+              const n = parseFloat(amountStr || '0');
+              const price = inMintStr === SOL ? solUsd : trollUsd;
+              const usd = Number.isFinite(n) && price ? (n * price) : null;
+              return (
+                <div style={{ marginTop: 6, color: '#aee', fontSize: 12 }}>
+                  {usd !== null ? `≈ $${usd.toFixed(2)}` : '≈ $—'}
+                </div>
+              );
+            })()}
+
+            <div style={{ marginTop: 8 }}>
+              <input
+                type="range" min={0} max={100} step={1}
+                value={percent}
+                onChange={(e) => setPercent(parseInt(e.target.value, 10))}
+                style={{ width: '100%' }}
+              />
+              <div style={{ display: 'flex', gap: 8, marginTop: 6, flexWrap: 'wrap' }}>
+                {[25, 50, 75, 100].map((p) => (
+                  <button key={p} type="button" onClick={() => setPercent(p)} style={chipStyle}>{p}%</button>
+                ))}
+              </div>
+            </div>
+
+            {/* To */}
+            <Row style={{ marginTop: 16 }}>
+              <label style={{ color: '#cfe' }}>To</label>
+              <select value={outMintStr} onChange={(e) => setOutMintStr(e.target.value)} style={selectStyle}>
+                <option value={TROLL}>TROLL</option>
+                <option value={SOL}>SOL</option>
+              </select>
+              <button onClick={flip} type="button" style={btnFlip}>⇅</button>
+            </Row>
+
+            {/* Actions */}
+            <div className="actions">
+              <button disabled={loading} onClick={getBestRoute} type="button" style={btnPrimary}>
+                {loading ? 'Finding route…' : 'Get Best Route'}
+              </button>
+              <RippleButton onClick={doSwap} type="button" style={btnAccent}>Swap</RippleButton>
+              <button onClick={refreshBalances} type="button" style={btnGhost}>Refresh</button>
+            </div>
+
+            {/* Route info */}
+            {quoteResponseMeta && (() => {
+              const pip = quoteResponseMeta?.quoteResponse?.priceImpactPct
+                ? parseFloat(quoteResponseMeta.quoteResponse.priceImpactPct) * 100
+                : null;
+              const tint =
+                pip === null ? 'rgba(255,255,255,0.6)' :
+                pip < 1 ? '#8ef7c0' :
+                pip < 3 ? '#ffd37a' :
+                '#ff9aa2';
+              return (
+                <div style={{ marginTop: 12, fontSize: 13, color: tint }}>
+                  Price impact: {pip !== null ? `${pip.toFixed(2)}%` : '—'}
+                </div>
+              );
+            })()}
+
+            {error && <div style={{ color: '#ff9aa2', marginTop: 8 }}>Error: {String(error)}</div>}
+          </div>
+        </div>
+
+        <div style={{ textAlign: 'center', marginTop: 14, color: 'rgba(255,255,255,0.55)', fontSize: 12 }}>
+          Powered by <a href="https://balinettechnologies.com" target="_blank" rel="noreferrer">Balinet Technologies Ltd</a>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ======
+   Styles
+   ====== */
+const inputStyle: React.CSSProperties = {
+  flex: 1,
+  background: 'rgba(0,0,0,0.4)',
+  color: '#fff',
+  border: '1px solid rgba(255,255,255,0.15)',
+  borderRadius: 12,
+  padding: '12px 14px',
+  fontSize: 16,
+  outline: 'none'
+};
+const selectStyle: React.CSSProperties = {
+  flex: 1,
+  background: 'rgba(0,0,0,0.4)',
+  color: '#fff',
+  border: '1px solid rgba(255,255,255,0.15)',
+  borderRadius: 12,
+  padding: '10px 12px',
+  fontSize: 15,
+  outline: 'none'
+};
+const btnPrimary: React.CSSProperties = {
+  flex: 1,
+  padding: '12px 16px',
+  borderRadius: 12,
+  border: '1px solid rgba(255,255,255,0.15)',
+  background: 'linear-gradient(135deg,#6a11cb,#2575fc)',
+  color: '#fff',
+  fontWeight: 700,
+  cursor: 'pointer'
+};
+const btnAccent: React.CSSProperties = {
+  flex: 1,
+  padding: '12px 16px',
+  borderRadius: 12,
+  border: '1px solid rgba(255,255,255,0.15)',
+  background: 'linear-gradient(135deg,#00f260,#0575e6)',
+  color: '#0b1120',
+  fontWeight: 800,
+  cursor: 'pointer'
+};
+const btnGhost: React.CSSProperties = {
+  padding: '10px 12px',
+  borderRadius: 12,
+  border: '1px solid rgba(255,255,255,0.15)',
+  background: 'rgba(255,255,255,0.06)',
+  color: '#dff',
+  fontWeight: 700,
+  cursor: 'pointer'
+};
+const chipStyle: React.CSSProperties = {
+  padding: '6px 10px',
+  borderRadius: 999,
+  border: '1px solid rgba(255,255,255,0.15)',
+  background: 'rgba(255,255,255,0.05)',
+  color: '#cfe',
+  fontSize: 12,
+  cursor: 'pointer'
+};
+const btnFlip: React.CSSProperties = {
+  padding: '10px 12px',
+  borderRadius: 12,
+  border: '1px solid rgba(255,255,255,0.15)',
+  background: 'linear-gradient(135deg,#f7971e,#ffd200)',
+  color: '#1b1b1f',
+  fontWeight: 900,
+  cursor: 'pointer'
+};
+const hintStyle: React.CSSProperties = {
+  marginLeft: 8,
+  opacity: 0.7,
+  color: 'rgba(255,255,255,0.75)',
+  fontSize: 12,
+};
