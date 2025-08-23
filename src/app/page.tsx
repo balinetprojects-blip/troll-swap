@@ -9,8 +9,15 @@ import {
   useRef,
   useState,
 } from 'react';
+import Image from 'next/image';
 import JSBI from 'jsbi';
-import { Connection, PublicKey } from '@solana/web3.js';
+import {
+  Connection,
+  PublicKey,
+  ParsedAccountData,
+  ParsedAccountInfo,
+  AccountInfo,
+} from '@solana/web3.js';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { JupiterProvider, useJupiter } from '@jup-ag/react-hook';
 
@@ -27,13 +34,12 @@ const WalletButton = dynamic(
    ========= */
 const RPC   = process.env.NEXT_PUBLIC_RPC_URL!;
 const WS    = process.env.NEXT_PUBLIC_WS_URL;
-const TROLL = process.env.NEXT_PUBLIC_TROLL_MINT!;     // 6VaiLPR5VouK91oFbZigfSU6Gu7A4aRToTXNb7R6ZVjB
-const SOL   = process.env.NEXT_PUBLIC_SOL_MINT!;       // So11111111111111111111111111111111111111112
+const TROLL = process.env.NEXT_PUBLIC_TROLL_MINT!;
+const SOL   = process.env.NEXT_PUBLIC_SOL_MINT!; // So1111...
 
 /* ===================
    Helpers & Constants
    =================== */
-const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 const SOL_FEE_BUFFER = 0.0005;
 
 function clamp(n: number, min: number, max: number) {
@@ -42,10 +48,22 @@ function clamp(n: number, min: number, max: number) {
 function fmt(n: number, dp = 6) {
   return Number.isFinite(n) ? n.toFixed(dp) : '0';
 }
+
+/**
+ * Read decimals from a parsed mint account without using `any`.
+ */
 async function getMintDecimals(connection: Connection, mintPk: PublicKey): Promise<number> {
   const info = await connection.getParsedAccountInfo(mintPk);
-  const decimals = (info.value as any)?.data?.parsed?.info?.decimals;
-  return typeof decimals === 'number' ? decimals : 9;
+  const v = info.value as (ParsedAccountInfo<ParsedAccountData> | AccountInfo<Buffer> | null);
+  if (v && 'data' in v) {
+    const data = v.data;
+    if (typeof (data as any) === 'object' && (data as ParsedAccountData).parsed) {
+      const parsed = (data as ParsedAccountData).parsed as any;
+      const dec = parsed?.info?.decimals;
+      if (typeof dec === 'number') return dec;
+    }
+  }
+  return 9;
 }
 
 /* ============
@@ -73,94 +91,15 @@ function GlobalStyles() {
         filter: blur(18px); opacity: 0.45; animation: brandPulse 2.6s ease-in-out infinite alternate; z-index: -1;
       }
       @keyframes brandPulse { from { opacity: 0.25; } to { opacity: 0.55; } }
-      .responsive-image { width:100%; height:auto; display:block; border-radius:8px; box-shadow:0 4px 8px rgba(0,0,0,0.1); }
 
-      /* ---------- Layout shells ---------- */
-      .shell {
-        min-height: 100vh;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        padding: 16px;
-        background:
-          radial-gradient(1200px 600px at 10% 10%, #0ff2, transparent 60%),
-          radial-gradient(1200px 600px at 90% 20%, #f0f2, transparent 60%),
-          linear-gradient(135deg,#0b1220,#0f0f17 40%,#0b0b0f);
+      /* Mobile tweaks */
+      @media (max-width: 640px){
+        .shell { padding: 14px !important; border-radius: 18px !important; }
+        .grid-2 { grid-template-columns: 1fr !important; }
+        .action-row { flex-direction: column; }
+        .action-row > * { width: 100%; }
+        .buy-row { gap: 8px !important; }
       }
-      .panel {
-        width: 100%;
-        max-width: 760px;
-        border-radius: 24px;
-        padding: 24px;
-        backdrop-filter: blur(10px);
-        background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.02));
-        border: 1px solid rgba(255,255,255,0.08);
-        box-shadow: 0 20px 60px rgba(0,0,0,0.5);
-      }
-      .header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        gap: 12px;
-        margin-bottom: 16px;
-      }
-      .header-left {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        min-width: 0;
-      }
-      .balances {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 12px;
-        margin-bottom: 16px;
-      }
-      .buy-row {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        margin-bottom: 16px;
-        flex-wrap: wrap;
-      }
-      .actions {
-        display: flex;
-        gap: 12px;
-        margin-top: 16px;
-      }
-
-      /* ---------- Mobile tweaks ---------- */
-      @media (max-width: 700px) {
-        .panel { padding: 16px; border-radius: 18px; }
-        .balances { grid-template-columns: 1fr; }
-      }
-      @media (max-width: 560px) {
-        .header { flex-direction: column; align-items: stretch; gap: 10px; }
-        .actions { flex-direction: column; }
-        .actions > * { width: 100% !important; }
-        .buy-row { flex-direction: column; align-items: stretch; }
-        .buy-row button { width: 100%; }
-      }
-      @keyframes floaty { 0%{transform:translateY(0)} 50%{transform:translateY(-4px)} 100%{transform:translateY(0)} }
-      @keyframes spinSlow { from{transform:rotate(0)} to{transform:rotate(360deg)} }
-      .logoWrap{
-        width: 52px; height: 52px; border-radius: 14px; overflow: hidden;
-        border: 1px solid rgba(255,255,255,0.12);
-        background: radial-gradient(60% 60% at 40% 30%, #2a2a2a, #171717 70%);
-        position: relative; animation: floaty 6s ease-in-out infinite; transition: transform .3s ease;
-      }
-      .logoAura::after{
-        content:""; position:absolute; inset:-6px; border-radius:16px; pointer-events:none;
-        border: 1px solid rgba(255,255,255,0.12);
-        box-shadow: 0 0 22px var(--brand), 0 0 6px rgba(0,0,0,0.35) inset;
-        animation: logoGlow 2.1s ease-in-out infinite alternate;
-      }
-      @keyframes logoGlow {
-        from { box-shadow: 0 0 10px var(--brand), 0 0 2px rgba(0,0,0,0.35) inset }
-        to   { box-shadow: 0 0 24px var(--brand-strong), 0 0 6px rgba(0,0,0,0.35) inset }
-      }
-      .logoImg{ width:100%; height:100%; object-fit:cover; display:block; }
-      .logoWrap:hover .logoImg{ animation: spinSlow 12s linear infinite; }
     `}</style>
   );
 }
@@ -168,9 +107,59 @@ function GlobalStyles() {
 /* =========
    Components
    ========= */
-function Logo() { return <div className="logoWrap logoAura"><img src="/troll.png" alt="Troll Logo" className="logoImg"
-  onError={(e) => { const t=e.currentTarget; t.style.display='none'; const fb=document.createElement('div'); fb.textContent='T';
-    fb.style.cssText='width:100%;height:100%;display:grid;place-items:center;color:#9ff;font-weight:900;font-size:20px;'; t.parentElement?.appendChild(fb); }} /></div>; }
+function Logo() {
+  return (
+    <>
+      <div className="logoWrap logoAura" style={{ position: 'relative' }}>
+        {/* Next/Image with fill, keeps your styles */}
+        <Image
+          src="/troll.png"
+          alt="Troll Logo"
+          fill
+          style={{ objectFit: 'cover', borderRadius: 14 }}
+          onError={(e) => {
+            // fallback letter if image missing
+            const t = (e.target as any) as HTMLImageElement;
+            const parent = t?.parentElement;
+            if (parent) {
+              parent.innerHTML = '';
+              const fb = document.createElement('div');
+              fb.textContent = 'T';
+              fb.style.cssText = `
+                width:100%;height:100%;display:grid;place-items:center;
+                color:#9ff;font-weight:900;font-size:20px;border-radius:14px;
+                background: radial-gradient(60% 60% at 40% 30%, #2a2a2a, #171717 70%);
+                border:1px solid rgba(255,255,255,.12)
+              `;
+              parent.appendChild(fb);
+            }
+          }}
+          priority
+        />
+      </div>
+
+      <style jsx>{`
+        @keyframes floaty { 0%{transform:translateY(0)} 50%{transform:translateY(-4px)} 100%{transform:translateY(0)} }
+        .logoWrap{
+          width: 52px; height: 52px; border-radius: 14px; overflow: hidden;
+          border: 1px solid rgba(255,255,255,0.12);
+          background: radial-gradient(60% 60% at 40% 30%, #2a2a2a, #171717 70%);
+          position: relative; animation: floaty 6s ease-in-out infinite;
+        }
+        .logoAura::after{
+          content:""; position:absolute; inset:-6px; border-radius:16px; pointer-events:none;
+          border: 1px solid rgba(255,255,255,0.12);
+          box-shadow: 0 0 22px var(--brand), 0 0 6px rgba(0,0,0,0.35) inset;
+          animation: logoGlow 2.1s ease-in-out infinite alternate;
+        }
+        @keyframes logoGlow {
+          from { box-shadow: 0 0 10px var(--brand), 0 0 2px rgba(0,0,0,0.35) inset }
+          to   { box-shadow: 0 0 24px var(--brand-strong), 0 0 6px rgba(0,0,0,0.35) inset }
+        }
+      `}</style>
+    </>
+  );
+}
 
 type RBProps = React.ButtonHTMLAttributes<HTMLButtonElement>;
 function RippleButton({ children, onClick, style, disabled, className, ...rest }: RBProps) {
@@ -263,7 +252,6 @@ export default function Page() {
 function SwapScreen({ connection }: { connection: Connection }) {
   const { publicKey, sendTransaction, connected } = useWallet();
 
-  // SSR guard for wallet UI
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
 
@@ -292,7 +280,7 @@ function SwapScreen({ connection }: { connection: Connection }) {
   // Discovered TROLL token account (not just ATA)
   const trollAcctRef = useRef<PublicKey | null>(null);
 
-  // --- Buying block (Pesapal link + address chip)
+  // Buying block helpers
   const [copied, setCopied] = useState(false);
   const addressStr = publicKey?.toBase58() ?? '';
   const pesapalUrl = useMemo(() => {
@@ -336,10 +324,24 @@ function SwapScreen({ connection }: { connection: Connection }) {
       if (resp.value.length > 0) {
         const acct = resp.value[0];
         trollAcctRef.current = acct.pubkey;
-        const parsed = (acct.account.data as any)?.parsed;
-        const ui = parsed?.info?.tokenAmount?.uiAmount ?? null;
-        if (ui !== null) setTrollBalance(ui);
-        else {
+
+        // Parse token amount with types
+        const data = acct.account.data as unknown;
+        let uiAmount: number | null = null;
+        if (
+          typeof data === 'object' &&
+          data !== null &&
+          (data as ParsedAccountData).parsed &&
+          (data as ParsedAccountData).program === 'spl-token'
+        ) {
+          const parsed = (data as ParsedAccountData).parsed as any;
+          const maybe = parsed?.info?.tokenAmount?.uiAmount;
+          if (typeof maybe === 'number') uiAmount = maybe;
+        }
+
+        if (uiAmount !== null) {
+          setTrollBalance(uiAmount);
+        } else {
           const bal = await connection.getTokenAccountBalance(acct.pubkey).catch(() => null);
           setTrollBalance(bal?.value?.uiAmount ?? 0);
         }
@@ -359,14 +361,13 @@ function SwapScreen({ connection }: { connection: Connection }) {
     return () => clearInterval(id);
   }, [refreshBalances]);
 
-  // USD prices via Jupiter Price API (refresh every 30s)
+  // USD prices via Jupiter API (30s)
   useEffect(() => {
     let stop = false;
     async function loadPrices() {
       try {
-        const u = new URL('https://price.jup.ag/v6/price');
-        u.searchParams.set('ids', `SOL,${TROLL}`);
-        const r = await fetch(u.toString(), { cache: 'no-store' });
+        const q = new URLSearchParams({ ids: `SOL,${TROLL}` });
+        const r = await fetch(`https://price.jup.ag/v4/price?${q.toString()}`, { cache: 'no-store' });
         const json = await r.json();
         if (!stop) {
           const sol = json?.data?.SOL?.price ?? null;
@@ -484,14 +485,33 @@ function SwapScreen({ connection }: { connection: Connection }) {
   }
 
   return (
-    <div className="shell">
-      <div className="panel">
+    <div style={{
+      minHeight: '100vh',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: 16,
+      background:
+        'radial-gradient(1200px 600px at 10% 10%, #0ff2, transparent 60%),' +
+        'radial-gradient(1200px 600px at 90% 20%, #f0f2, transparent 60%),' +
+        'linear-gradient(135deg,#0b1220,#0f0f17 40%,#0b0b0f)'
+    }}>
+      <div className="shell" style={{
+        width: '100%',
+        maxWidth: 760,
+        borderRadius: 24,
+        padding: 24,
+        backdropFilter: 'blur(10px)',
+        background: 'linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.02))',
+        border: '1px solid rgba(255,255,255,0.08)',
+        boxShadow: '0 20px 60px rgba(0,0,0,0.5)'
+      }}>
         {/* Header */}
-        <div className="header">
-          <div className="header-left">
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, gap: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
             <Logo />
-            <div style={{ minWidth: 0 }}>
-              <div style={{ color: '#fff', fontSize: 18, fontWeight: 700, lineHeight: 1.1 }}>Troll Swap</div>
+            <div>
+              <div style={{ color: '#fff', fontSize: 18, fontWeight: 700 }}>Troll Swap</div>
               <div style={{ color: 'rgba(255,255,255,0.6)', fontSize: 12 }}>SOL ↔ TROLL</div>
             </div>
           </div>
@@ -499,7 +519,7 @@ function SwapScreen({ connection }: { connection: Connection }) {
         </div>
 
         {/* Balances */}
-        <div className="balances">
+        <div className="grid-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 16 }}>
           <BalanceCard
             label="SOL Balance"
             value={fmt(solBalance, 6)}
@@ -517,7 +537,7 @@ function SwapScreen({ connection }: { connection: Connection }) {
         </div>
 
         {/* Buying SOL */}
-        <div className="buy-row">
+        <div className="buy-row" style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
           {addressStr ? (
             <div style={{
               display: 'flex', alignItems: 'center', gap: 8,
@@ -526,9 +546,9 @@ function SwapScreen({ connection }: { connection: Connection }) {
               background: 'rgba(255,255,255,0.06)', color: '#cfe',
               fontSize: 12, maxWidth: '100%'
             }}>
-              <span>Copy Your Solana Address First:- </span>
+              <span>Copy Your Solana Address First:-</span>
               <span style={{ fontFamily: 'monospace' }}>
-                {addressStr.slice(0, 4)}…{addressStr.slice(-4)}
+                &nbsp;{addressStr.slice(0, 4)}…{addressStr.slice(-4)}
               </span>
               <button onClick={copyAddr} type="button" style={{
                 padding: '4px 8px', borderRadius: 999, border: '1px solid rgba(255,255,255,0.15)',
@@ -547,7 +567,17 @@ function SwapScreen({ connection }: { connection: Connection }) {
             <button style={btnGhost}>GET SOLANA HERE</button>
           </a>
 
-          <img src="/payment_methods.png" alt="Payment methods" className="responsive-image" />
+          {/* Payment methods image via Next/Image */}
+          <div style={{ position: 'relative', width: 162, height: 36 }}>
+            <Image
+              src="/payment_methods.png"
+              alt="Payment methods"
+              fill
+              sizes="162px"
+              style={{ objectFit: 'contain', borderRadius: 8 }}
+              priority
+            />
+          </div>
         </div>
 
         {/* Swap card */}
@@ -641,7 +671,7 @@ function SwapScreen({ connection }: { connection: Connection }) {
             </Row>
 
             {/* Actions */}
-            <div className="actions">
+            <div className="action-row" style={{ display: 'flex', gap: 12, marginTop: 16 }}>
               <button disabled={loading} onClick={getBestRoute} type="button" style={btnPrimary}>
                 {loading ? 'Finding route…' : 'Get Best Route'}
               </button>
@@ -669,7 +699,7 @@ function SwapScreen({ connection }: { connection: Connection }) {
             {error && <div style={{ color: '#ff9aa2', marginTop: 8 }}>Error: {String(error)}</div>}
           </div>
         </div>
-
+        
         <div style={{ textAlign: 'center', marginTop: 14, color: 'rgba(255,255,255,0.55)', fontSize: 12 }}>
           Powered by <a href="https://balinettechnologies.com" target="_blank" rel="noreferrer">Balinet Technologies Ltd</a>
         </div>
