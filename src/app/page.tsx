@@ -668,9 +668,9 @@ function SwapScreen({ connection }: { connection: Connection }) {
 
             {/* Actions */}
             <div className="action-row" style={{ display: 'flex', gap: 12, marginTop: 16 }}>
-              <button disabled={loading} onClick={getBestRoute} type="button" style={btnPrimary}>
+              {/*<button disabled={loading} onClick={getBestRoute} type="button" style={btnPrimary}>
                 {loading ? 'Finding route…' : 'Get Best Route'}
-              </button>
+              </button>*/}
               <RippleButton onClick={doSwap} type="button" style={btnAccent}>Swap</RippleButton>
               <button onClick={refreshBalances} type="button" style={btnGhost}>Refresh</button>
             </div>
