@@ -36,6 +36,11 @@ const RPC   = process.env.NEXT_PUBLIC_RPC_URL!;
 const WS    = process.env.NEXT_PUBLIC_WS_URL;
 const TROLL = process.env.NEXT_PUBLIC_TROLL_MINT!;
 const SOL   = process.env.NEXT_PUBLIC_SOL_MINT!; // So1111...
+const CLUSTER = process.env.NEXT_PUBLIC_SOLANA_CLUSTER || 'mainnet';
+function solscanTxUrl(sig: string) {
+  const suffix = CLUSTER === 'mainnet' ? '' : `?cluster=${CLUSTER}`;
+  return `https://solscan.io/tx/${sig}${suffix}`;
+}
 
 /* ===================
    Helpers & Constants
@@ -227,6 +232,27 @@ function BalanceCard({
   );
 }
 
+type ToastKind = 'success' | 'error' | 'info';
+type Toast = { id: number; kind: ToastKind; message: string };
+
+function useToasts() {
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const nextId = useRef(1);
+
+  const push = useCallback((kind: ToastKind, message: string, ms = 3500) => {
+    const id = nextId.current++;
+    setToasts((t) => [...t, { id, kind, message }]);
+    if (ms > 0) setTimeout(() => dismiss(id), ms);
+  }, []);
+
+  const dismiss = useCallback((id: number) => {
+    setToasts((t) => t.filter((x) => x.id !== id));
+  }, []);
+
+  return { toasts, push, dismiss };
+}
+
+
 /* ==============
    Default export
    ============== */
@@ -251,35 +277,35 @@ export default function Page() {
 function SwapScreen({ connection }: { connection: Connection }) {
   const { publicKey, sendTransaction, connected } = useWallet();
 
+  // ---------- UI/SSR ----------
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
 
-  // Token selection
+  // ---------- Token selection ----------
   const [inMintStr, setInMintStr]   = useState<string>(SOL);
   const [outMintStr, setOutMintStr] = useState<string>(TROLL);
-
   const inputMint  = useMemo(() => new PublicKey(inMintStr),  [inMintStr]);
   const outputMint = useMemo(() => new PublicKey(outMintStr), [outMintStr]);
   const trollPk    = useMemo(() => new PublicKey(TROLL), []);
 
-  // Amount / slider
+  // ---------- Amount / slider ----------
   const [amountStr, setAmountStr] = useState<string>('0.1');
   const [percent, setPercent]     = useState<number>(0);
 
-  // Decimals + balances
+  // ---------- Decimals + balances ----------
   const [inputDecimals, setInputDecimals] = useState<number>(9);
   const [solBalance, setSolBalance]       = useState<number>(0);
   const [trollBalance, setTrollBalance]   = useState<number>(0);
   const [trollDecimals, setTrollDecimals] = useState<number>(9);
 
-  // USD prices
+  // ---------- USD prices ----------
   const [solUsd, setSolUsd]       = useState<number | null>(null);
   const [trollUsd, setTrollUsd]   = useState<number | null>(null);
 
-  // Discovered TROLL token account (not just ATA)
+  // ---------- Discovered TROLL token account ----------
   const trollAcctRef = useRef<PublicKey | null>(null);
 
-  // Buying block helpers
+  // ---------- Buy helpers (Pesapal) ----------
   const [copied, setCopied] = useState(false);
   const addressStr = publicKey?.toBase58() ?? '';
   const pesapalUrl = useMemo(() => {
@@ -298,10 +324,31 @@ function SwapScreen({ connection }: { connection: Connection }) {
     });
   }
 
-  // Balances refresher (robust)
+  // ---------- Toasts + Modal ----------
+  type ToastKind = 'success' | 'error' | 'info';
+  type Toast = { id: number; kind: ToastKind; message: string; href?: string };
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const toastIdRef = useRef(1);
+
+  function pushToast(kind: ToastKind, message: string, href?: string) {
+    const id = toastIdRef.current++;
+    setToasts((t) => [...t, { id, kind, message, href }]);
+    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4500);
+  }
+  function dismissToast(id: number) {
+    setToasts((t) => t.filter((x) => x.id !== id));
+  }
+
+  const [showModal, setShowModal] = useState(false);
+  const [lastTx, setLastTx] = useState<string | null>(null);
+  const solscanUrl = lastTx ? `https://solscan.io/tx/${lastTx}` : null;
+
+  // ---------- Balances refresher (robust) ----------
   const refreshBalances = useCallback(async () => {
     if (!publicKey) {
-      setSolBalance(0); setTrollBalance(0); trollAcctRef.current = null;
+      setSolBalance(0);
+      setTrollBalance(0);
+      trollAcctRef.current = null;
       return;
     }
     try {
@@ -324,13 +371,18 @@ function SwapScreen({ connection }: { connection: Connection }) {
         const acct = resp.value[0];
         trollAcctRef.current = acct.pubkey;
 
-        // Parse token amount with types
-        const data = acct.account.data as unknown;
+        // Safely read parsed tokenAmount.uiAmount without `any`
+        const dataUnknown: unknown = acct.account.data;
         let uiAmount: number | null = null;
         if (
-          typeof data === 'object' && (data as ParsedAccountData).parsed
+          typeof dataUnknown === 'object' &&
+          dataUnknown !== null &&
+          'parsed' in (dataUnknown as object)
         ) {
-          const parsed = (data as ParsedAccountData).parsed as any;
+          const parsed = (dataUnknown as {
+            parsed: { info?: { tokenAmount?: { uiAmount?: unknown } } }
+          }).parsed;
+
           const maybe = parsed?.info?.tokenAmount?.uiAmount;
           if (typeof maybe === 'number') uiAmount = maybe;
         }
@@ -350,27 +402,26 @@ function SwapScreen({ connection }: { connection: Connection }) {
     }
   }, [connection, publicKey, trollPk]);
 
-  // Background polling (10s)
+  // ---------- Poll balances ----------
   useEffect(() => {
     refreshBalances();
     const id = setInterval(refreshBalances, 10000);
     return () => clearInterval(id);
   }, [refreshBalances]);
 
-  // USD prices via Jupiter API (30s)
+  // ---------- USD prices via Jupiter ----------
   useEffect(() => {
     let stop = false;
     async function loadPrices() {
       try {
         const q = new URLSearchParams({ ids: `SOL,${TROLL}` });
         const r = await fetch(`https://price.jup.ag/v4/price?${q.toString()}`, { cache: 'no-store' });
-        const json = await r.json();
-        if (!stop) {
-          const sol = json?.data?.SOL?.price ?? null;
-          const troll = json?.data?.[TROLL]?.price ?? null;
-          setSolUsd(typeof sol === 'number' ? sol : null);
-          setTrollUsd(typeof troll === 'number' ? troll : null);
-        }
+        const json = (await r.json()) as unknown;
+        const getNum = (v: unknown): number | null => (typeof v === 'number' ? v : null);
+        const data = (json as { data?: Record<string, { price?: unknown }> }).data ?? {};
+        const sol = getNum(data.SOL?.price);
+        const troll = getNum(data[TROLL]?.price);
+        if (!stop) { setSolUsd(sol); setTrollUsd(troll); }
       } catch {
         if (!stop) { setSolUsd(null); setTrollUsd(null); }
       }
@@ -380,7 +431,7 @@ function SwapScreen({ connection }: { connection: Connection }) {
     return () => { stop = true; clearInterval(id); };
   }, []);
 
-  // Optional WS subscription with fallback to fast polling (3s)
+  // ---------- Optional WS subscription with fallback ----------
   const fastPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   useEffect(() => {
     if (!WS || !publicKey) return;
@@ -411,7 +462,7 @@ function SwapScreen({ connection }: { connection: Connection }) {
     };
   }, [connection, publicKey, refreshBalances]);
 
-  // Keep input decimals in sync
+  // ---------- Keep input decimals in sync ----------
   useEffect(() => {
     (async () => {
       if (inMintStr === SOL) setInputDecimals(9);
@@ -419,27 +470,27 @@ function SwapScreen({ connection }: { connection: Connection }) {
     })();
   }, [connection, inMintStr]);
 
-  // Immediate refresh on connect / select changes
+  // ---------- Immediate refresh on connect / select changes ----------
   useEffect(() => { refreshBalances(); }, [connected, publicKey, refreshBalances]);
   useEffect(() => { refreshBalances(); }, [inMintStr, outMintStr, refreshBalances]);
 
-  // Slider ⇒ amount
+  // ---------- Slider ⇒ amount ----------
   useEffect(() => {
     if (!connected) return;
     const base = inMintStr === SOL ? Math.max(0, solBalance - SOL_FEE_BUFFER) : trollBalance;
-    const val = clamp((base * percent) / 100, 0, base);
+    const val = Math.min(base, Math.max(0, (base * percent) / 100));
     const dp  = Math.min(6, inputDecimals);
     setAmountStr(val > 0 ? String(Number(val.toFixed(dp))) : '0');
   }, [percent, connected, inMintStr, solBalance, trollBalance, inputDecimals]);
 
-  // UI amount ⇒ atomic
+  // ---------- UI amount ⇒ atomic ----------
   const amountAtomic = useMemo(() => {
     const n = Number.parseFloat(amountStr || '0');
     const atomic = Math.floor((Number.isFinite(n) && n > 0 ? n : 0) * 10 ** inputDecimals);
     return JSBI.BigInt(atomic.toString());
   }, [amountStr, inputDecimals]);
 
-  // Jupiter v6
+  // ---------- Jupiter v6 ----------
   const { fetchQuote, quoteResponseMeta, fetchSwapTransaction, refresh, loading, error } = useJupiter({
     amount: amountAtomic,
     inputMint,
@@ -447,12 +498,18 @@ function SwapScreen({ connection }: { connection: Connection }) {
     slippageBps: 50,
   });
 
-  async function getBestRoute() { await fetchQuote(); }
-
   async function doSwap() {
-    if (!publicKey) return alert('Connect wallet first');
+    if (!publicKey) {
+      pushToast('error', 'Connect your wallet first.');
+      return;
+    }
+    pushToast('info', 'Building route…');
+
     const quote = quoteResponseMeta ?? (await fetchQuote());
-    if (!quote) return alert('No route found');
+    if (!quote) {
+      pushToast('error', 'No route found for this pair/amount.');
+      return;
+    }
 
     const res = await fetchSwapTransaction({
       quoteResponseMeta: quote,
@@ -461,16 +518,28 @@ function SwapScreen({ connection }: { connection: Connection }) {
       allowOptimizedWrappedSolTokenAccount: true,
       prioritizationFeeLamports: 0,
     });
-    if ('error' in res) { console.error(res.error); return alert('Failed to build swap transaction'); }
+
+    if ('error' in res) {
+      console.error(res.error);
+      pushToast('error', 'Failed to build swap transaction.');
+      return;
+    }
 
     try {
-      const txid = await sendTransaction(res.swapTransaction, connection, { maxRetries: 3, skipPreflight: false });
-      alert(`Sent: ${txid}`);
+      const txid = await sendTransaction(res.swapTransaction, connection, {
+        maxRetries: 3,
+        skipPreflight: false,
+      });
+
+      setLastTx(txid);
+      setShowModal(true);
+      pushToast('success', 'Swap sent! View on Solscan ↗', `https://solscan.io/tx/${txid}`);
+
       await refresh();
       await refreshBalances();
     } catch (e) {
       console.error(e);
-      alert('Swap failed to send');
+      pushToast('error', 'Swap failed to send.');
     }
   }
 
@@ -480,6 +549,14 @@ function SwapScreen({ connection }: { connection: Connection }) {
     setPercent(0);
   }
 
+  const swapDisabled =
+    loading ||
+    !connected ||
+    !publicKey ||
+    !Number.isFinite(Number(amountStr)) ||
+    Number(amountStr) <= 0;
+
+  // ---------- Render ----------
   return (
     <div style={{
       minHeight: '100vh',
@@ -563,7 +640,6 @@ function SwapScreen({ connection }: { connection: Connection }) {
             <button style={btnGhost}>GET SOLANA HERE</button>
           </a>
 
-          {/* Payment methods image via Next/Image */}
           <div style={{ position: 'relative', width: 162, height: 36 }}>
             <Image
               src="/payment_methods.png"
@@ -608,7 +684,7 @@ function SwapScreen({ connection }: { connection: Connection }) {
                 onChange={(e) => {
                   const v = parseFloat(e.target.value || '0');
                   const base = inMintStr === SOL ? Math.max(0, solBalance - SOL_FEE_BUFFER) : trollBalance;
-                  const p = base > 0 ? clamp((v / base) * 100, 0, 100) : 0;
+                  const p = base > 0 ? Math.min(100, Math.max(0, (v / base) * 100)) : 0;
                   setAmountStr(e.target.value);
                   setPercent(Math.round(p));
                 }}
@@ -668,10 +744,9 @@ function SwapScreen({ connection }: { connection: Connection }) {
 
             {/* Actions */}
             <div className="action-row" style={{ display: 'flex', gap: 12, marginTop: 16 }}>
-              {/*<button disabled={loading} onClick={getBestRoute} type="button" style={btnPrimary}>
-                {loading ? 'Finding route…' : 'Get Best Route'}
-              </button>*/}
-              <RippleButton onClick={doSwap} type="button" style={btnAccent}>Swap</RippleButton>
+              <RippleButton onClick={doSwap} type="button" style={{ ...btnAccent, opacity: swapDisabled ? 0.6 : 1, cursor: swapDisabled ? 'not-allowed' : 'pointer' }} disabled={swapDisabled}>
+                {loading ? 'Preparing…' : 'Swap'}
+              </RippleButton>
               <button onClick={refreshBalances} type="button" style={btnGhost}>Refresh</button>
             </div>
 
@@ -695,14 +770,88 @@ function SwapScreen({ connection }: { connection: Connection }) {
             {error && <div style={{ color: '#ff9aa2', marginTop: 8 }}>Error: {String(error)}</div>}
           </div>
         </div>
-        
+
         <div style={{ textAlign: 'center', marginTop: 14, color: 'rgba(255,255,255,0.55)', fontSize: 12 }}>
           Powered by <a href="https://balinettechnologies.com" target="_blank" rel="noreferrer">Balinet Technologies Ltd</a>
         </div>
       </div>
+
+      {/* --------- Toasts (bottom-right) --------- */}
+      <div style={{
+        position: 'fixed', right: 16, bottom: 16, zIndex: 9999,
+        display: 'flex', flexDirection: 'column', gap: 8, maxWidth: 360
+      }}>
+        {toasts.map((t) => {
+          const bg =
+            t.kind === 'success' ? '#062e2a' :
+            t.kind === 'error'   ? '#2b0e15' :
+                                   '#0b1120';
+          const border =
+            t.kind === 'success' ? 'rgba(41,255,198,0.35)' :
+            t.kind === 'error'   ? 'rgba(255,90,120,0.35)' :
+                                   'rgba(255,255,255,0.12)';
+          return (
+            <div key={t.id} style={{
+              borderRadius: 12, padding: '12px 14px', color: '#e6f0ff',
+              background: bg, boxShadow: '0 16px 50px rgba(0,0,0,0.6)',
+              border: `1px solid ${border}`, display: 'flex', gap: 12, alignItems: 'center'
+            }}>
+              <span style={{ flex: 1 }}>
+                {t.href ? (
+                  <a href={t.href} target="_blank" rel="noreferrer" style={{ color: '#29ffc6', textDecoration: 'underline', fontWeight: 700 }}>
+                    {t.message}
+                  </a>
+                ) : t.message}
+              </span>
+              <button onClick={() => dismissToast(t.id)} style={{
+                border: 'none', background: 'rgba(255,255,255,0.15)', color: '#fff',
+                borderRadius: 8, padding: '4px 8px', cursor: 'pointer'
+              }}>Close</button>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* --------- Modal: Swap Completed --------- */}
+      {showModal && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          onClick={() => setShowModal(false)}
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)',
+            display: 'grid', placeItems: 'center', zIndex: 9998, padding: 12
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: '100%', maxWidth: 460, borderRadius: 16, padding: 20,
+              background: '#0b1120',
+              border: '1px solid rgba(255,255,255,0.12)', color: '#fff',
+              boxShadow: '0 30px 80px rgba(0,0,0,0.65)'
+            }}
+          >
+            <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 8 }}>Swap Completed 🎉</div>
+            <div style={{ fontSize: 14, opacity: 0.9, marginBottom: 14 }}>
+              Your transaction has been submitted to the network.
+            </div>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+              {solscanUrl && (
+                <a href={solscanUrl} target="_blank" rel="noreferrer">
+                  <button style={btnPrimary}>View on Solscan</button>
+                </a>
+              )}
+              <button onClick={() => setShowModal(false)} style={btnGhost}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
+
+
 
 /* ======
    Styles
