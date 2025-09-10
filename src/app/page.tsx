@@ -45,7 +45,7 @@ function solscanTxUrl(sig: string) {
 /* ===================
    Helpers & Constants
    =================== */
-const SOL_FEE_BUFFER = 0.0005;
+const SOL_FEE_BUFFER = 0.004;
 
 function clamp(n: number, min: number, max: number) {
   return Math.min(max, Math.max(min, n));
