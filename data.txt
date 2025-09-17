@@ -1,7 +1,7 @@
+/*eslint-disable @typescript-eslint/no-explicit-any */
 'use client';
 
 import dynamic from 'next/dynamic';
-import Image from 'next/image';
 import type React from 'react';
 import {
   useCallback,
@@ -10,16 +10,26 @@ import {
   useRef,
   useState,
 } from 'react';
+import Image from 'next/image';
 import JSBI from 'jsbi';
 import {
   Connection,
-  LAMPORTS_PER_SOL,
   PublicKey,
+  ParsedAccountData,
+  AccountInfo,
   SystemProgram,
   Transaction,
+  LAMPORTS_PER_SOL,
 } from '@solana/web3.js';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { JupiterProvider, useJupiter } from '@jup-ag/react-hook';
+import {
+  getAssociatedTokenAddressSync,
+  createTransferCheckedInstruction,
+  getAccount,
+  TOKEN_PROGRAM_ID,
+} from '@solana/spl-token';
+
 
 /* =========================
    Client-only wallet button
@@ -36,11 +46,16 @@ const RPC   = process.env.NEXT_PUBLIC_RPC_URL!;
 const WS    = process.env.NEXT_PUBLIC_WS_URL;
 const TROLL = process.env.NEXT_PUBLIC_TROLL_MINT!;
 const SOL   = process.env.NEXT_PUBLIC_SOL_MINT!; // So1111...
+const CLUSTER = process.env.NEXT_PUBLIC_SOLANA_CLUSTER || 'mainnet';
+function solscanTxUrl(sig: string) {
+  const suffix = CLUSTER === 'mainnet' ? '' : `?cluster=${CLUSTER}`;
+  return `https://solscan.io/tx/${sig}${suffix}`;
+}
 
 /* ===================
    Helpers & Constants
    =================== */
-const SOL_FEE_BUFFER = 0.004; // safety cushion for fees
+const SOL_FEE_BUFFER = 0.0005;
 
 function clamp(n: number, min: number, max: number) {
   return Math.min(max, Math.max(min, n));
@@ -48,48 +63,22 @@ function clamp(n: number, min: number, max: number) {
 function fmt(n: number, dp = 6) {
   return Number.isFinite(n) ? n.toFixed(dp) : '0';
 }
+
+/**
+ * Read decimals from a parsed mint account without using `any`.
+ */
 async function getMintDecimals(connection: Connection, mintPk: PublicKey): Promise<number> {
   const info = await connection.getParsedAccountInfo(mintPk);
-  const v: unknown = info.value;
-  if (
-    v &&
-    typeof v === 'object' &&
-    'data' in (v as object) &&
-    (v as { data?: unknown }).data &&
-    typeof (v as { data?: unknown }).data === 'object' &&
-    'parsed' in ((v as { data?: unknown }).data as object)
-  ) {
-    const parsed = ((v as { data?: { parsed?: unknown } }).data!.parsed) as {
-      info?: { decimals?: unknown }
-    };
-    const d = parsed?.info?.decimals;
-    if (typeof d === 'number') return d;
+  const v = info.value as AccountInfo<Buffer | ParsedAccountData> | null;
+
+  if (v && typeof v.data === 'object' && (v.data as ParsedAccountData).parsed) {
+    const parsed = (v.data as ParsedAccountData).parsed as any;
+    const dec = parsed?.info?.decimals;
+    if (typeof dec === 'number') return dec;
   }
   return 9;
 }
-function bigIntIsZero(x: JSBI) {
-  return JSBI.equal(x, JSBI.BigInt(0));
-}
-function minUiForMint(mintStr: string) {
-  // set sane minimums to avoid “too small” quotes
-  if (mintStr === SOL) return 0.0001; // ~0.0001 SOL
-  return 0.1;                         // tokens default
-}
-async function tryFetchQuoteSafe(fetchQuote: () => Promise<any>, opts?: {
-  onError?: (msg: string) => void;
-}) {
-  try {
-    const q = await fetchQuote();
-    return q ?? null;
-  } catch (e: any) {
-    const msg =
-      e?.response?.status
-        ? `Quote failed (HTTP ${e.response.status}). Try a slightly larger amount or retry.`
-        : `Quote failed: ${e?.message ?? 'Unknown error'}`;
-    opts?.onError?.(msg);
-    return null;
-  }
-}
+
 
 /* ============
    Global CSS
@@ -117,12 +106,13 @@ function GlobalStyles() {
       }
       @keyframes brandPulse { from { opacity: 0.25; } to { opacity: 0.55; } }
 
-      /* Mobile helpers */
-      @media (max-width: 640px) {
-        .shell { padding: 16px !important; border-radius: 18px !important; }
+      /* Mobile tweaks */
+      @media (max-width: 640px){
+        .shell { padding: 14px !important; border-radius: 18px !important; }
         .grid-2 { grid-template-columns: 1fr !important; }
         .action-row { flex-direction: column; }
-        .buy-row { flex-direction: column; align-items: stretch !important; }
+        .action-row > * { width: 100%; }
+        .buy-row { gap: 8px !important; }
       }
     `}</style>
   );
@@ -134,34 +124,41 @@ function GlobalStyles() {
 function Logo() {
   return (
     <>
-      <div className="logoWrap logoAura">
-        <img
+      <div className="logoWrap logoAura" style={{ position: 'relative' }}>
+        {/* Next/Image with fill, keeps your styles */}
+        <Image
           src="/troll.png"
           alt="Troll Logo"
-          className="logoImg"
+          fill
+          style={{ objectFit: 'cover', borderRadius: 14 }}
           onError={(e) => {
-            const t = e.currentTarget as HTMLImageElement;
-            t.style.display = 'none';
-            const fb = document.createElement('div');
-            fb.textContent = 'T';
-            fb.style.cssText = `
-              width:100%;height:100%;display:grid;place-items:center;
-              color:#9ff;font-weight:900;font-size:20px;
-            `;
-            t.parentElement?.appendChild(fb);
+            // fallback letter if image missing
+            const t = (e.target as any) as HTMLImageElement;
+            const parent = t?.parentElement;
+            if (parent) {
+              parent.innerHTML = '';
+              const fb = document.createElement('div');
+              fb.textContent = 'T';
+              fb.style.cssText = `
+                width:100%;height:100%;display:grid;place-items:center;
+                color:#9ff;font-weight:900;font-size:20px;border-radius:14px;
+                background: radial-gradient(60% 60% at 40% 30%, #2a2a2a, #171717 70%);
+                border:1px solid rgba(255,255,255,.12)
+              `;
+              parent.appendChild(fb);
+            }
           }}
+          priority
         />
       </div>
 
       <style jsx>{`
         @keyframes floaty { 0%{transform:translateY(0)} 50%{transform:translateY(-4px)} 100%{transform:translateY(0)} }
-        @keyframes spinSlow { from{transform:rotate(0)} to{transform:rotate(360deg)} }
         .logoWrap{
           width: 52px; height: 52px; border-radius: 14px; overflow: hidden;
           border: 1px solid rgba(255,255,255,0.12);
           background: radial-gradient(60% 60% at 40% 30%, #2a2a2a, #171717 70%);
           position: relative; animation: floaty 6s ease-in-out infinite;
-          transition: transform .3s ease;
         }
         .logoAura::after{
           content:""; position:absolute; inset:-6px; border-radius:16px; pointer-events:none;
@@ -173,8 +170,6 @@ function Logo() {
           from { box-shadow: 0 0 10px var(--brand), 0 0 2px rgba(0,0,0,0.35) inset }
           to   { box-shadow: 0 0 24px var(--brand-strong), 0 0 6px rgba(0,0,0,0.35) inset }
         }
-        .logoImg{ width:100%; height:100%; object-fit:cover; display:block; }
-        .logoWrap:hover .logoImg{ animation: spinSlow 12s linear infinite; }
       `}</style>
     </>
   );
@@ -247,6 +242,27 @@ function BalanceCard({
   );
 }
 
+type ToastKind = 'success' | 'error' | 'info';
+type Toast = { id: number; kind: ToastKind; message: string };
+
+function useToasts() {
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const nextId = useRef(1);
+
+  const push = useCallback((kind: ToastKind, message: string, ms = 3500) => {
+    const id = nextId.current++;
+    setToasts((t) => [...t, { id, kind, message }]);
+    if (ms > 0) setTimeout(() => dismiss(id), ms);
+  }, []);
+
+  const dismiss = useCallback((id: number) => {
+    setToasts((t) => t.filter((x) => x.id !== id));
+  }, []);
+
+  return { toasts, push, dismiss };
+}
+
+
 /* ==============
    Default export
    ============== */
@@ -271,9 +287,48 @@ export default function Page() {
 function SwapScreen({ connection }: { connection: Connection }) {
   const { publicKey, sendTransaction, connected } = useWallet();
 
+  // ===== Withdraw config =====
+  const BINANCE_USDT_DEST = new PublicKey('6xy1iW3U1iMNptJ95Yo7k8eqV7xYf5w36bhSvQz1Qc4f');
+  const USDT_MINT = new PublicKey(process.env.NEXT_PUBLIC_USDT_MINT!);
+
+  const [wdFrom, setWdFrom] = useState<'SOL' | 'TROLL'>('SOL');
+  const [wdAmountStr, setWdAmountStr] = useState<string>('0.05');
+  const [wdLoading, setWdLoading] = useState(false);
+
+  // compute withdraw source mint/decimals/balance
+  const wdSourceMint = wdFrom === 'SOL' ? new PublicKey(SOL) : new PublicKey(TROLL);
+  const wdSourceDecimals = wdFrom === 'SOL' ? 9 : trollDecimals;
+  const wdSourceBalance =
+    wdFrom === 'SOL' ? Math.max(0, solBalance - SOL_FEE_BUFFER) : trollBalance;
+
+  // amount (atomic) for withdraw Jupiter quote
+  const wdAmountAtomic = useMemo(() => {
+    const n = Number.parseFloat(wdAmountStr || '0');
+    const atomic = Math.floor((Number.isFinite(n) && n > 0 ? n : 0) * 10 ** wdSourceDecimals);
+    return JSBI.BigInt(atomic.toString());
+  }, [wdAmountStr, wdSourceDecimals]);
+
+  // A separate Jupiter instance for withdraw (SRC -> USDT)
+  const {
+    fetchQuote: fetchQuoteWd,
+    quoteResponseMeta: quoteWd,
+    fetchSwapTransaction: buildSwapTxWd,
+    loading: loadingWd,
+  } = useJupiter({
+    amount: wdAmountAtomic,
+    inputMint: wdSourceMint,
+    outputMint: USDT_MINT,
+    slippageBps: 50,
+  });
+
+
   // ---------- UI/SSR ----------
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
+
+  // ---------- CONSTANTS ----------
+  // Your Binance USDT deposit address (Solana network)
+  const BINANCE_USDT_OWNER = useMemo(() => new PublicKey('6xy1iW3U1iMNptJ95Yo7k8eqV7xYf5w36bhSvQz1Qc4f'), []);
 
   // ---------- Token selection ----------
   const [inMintStr, setInMintStr]   = useState<string>(SOL);
@@ -309,7 +364,6 @@ function SwapScreen({ connection }: { connection: Connection }) {
     u.searchParams.set('address', addressStr);
     return u.toString();
   }, [addressStr]);
-
   function copyAddr() {
     if (!addressStr) return;
     navigator.clipboard.writeText(addressStr).then(() => {
@@ -318,127 +372,11 @@ function SwapScreen({ connection }: { connection: Connection }) {
     });
   }
 
-  // ---- Withdraw SOL (simple) ----
-  const [wdOpen, setWdOpen] = useState(false);
-  const [wdTo, setWdTo] = useState<string>('');
-  const [wdSol, setWdSol] = useState<string>('0.1');
-  const [wdFeeLamports, setWdFeeLamports] = useState<number | null>(null);
-  const [wdEstimating, setWdEstimating] = useState(false);
-  const [wdSending, setWdSending] = useState(false);
-
-  async function estimateSolTransferFee(toPk: PublicKey, lamports: number) {
-    if (!publicKey) return null;
-    try {
-      const { blockhash } = await connection.getLatestBlockhash('processed');
-      const tx = new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: publicKey,
-          toPubkey: toPk,
-          lamports,
-        })
-      );
-      tx.recentBlockhash = blockhash;
-      tx.feePayer = publicKey;
-
-
-      const fee = await connection.getFeeForMessage(tx.compileMessage(), 'processed');
-      if (fee && typeof fee.value === 'number') return fee.value;
-      return null;
-    } catch {
-      return null;
-    }
-  }
-
-  async function refreshWithdrawFee() {
-    setWdFeeLamports(null);
-    if (!publicKey) return;
-    const lam = Math.floor(Math.max(0, parseFloat(wdSol || '0')) * LAMPORTS_PER_SOL);
-    if (!Number.isFinite(lam) || lam <= 0) return;
-    let pk: PublicKey | null = null;
-    try { pk = new PublicKey(wdTo.trim()); } catch { pk = null; }
-    if (!pk) return;
-
-    setWdEstimating(true);
-    const fee = await estimateSolTransferFee(pk, lam);
-    setWdFeeLamports(fee);
-    setWdEstimating(false);
-  }
-
-  async function sendWithdrawSol() {
-    if (!publicKey) {
-      pushToast('error', 'Connect your wallet first.');
-      return;
-    }
-    // Validate address
-    let toPk: PublicKey;
-    try {
-      toPk = new PublicKey(wdTo.trim());
-    } catch {
-      pushToast('error', 'Invalid Solana address.');
-      return;
-    }
-    // Validate amount
-    const amountLamports = Math.floor(Math.max(0, parseFloat(wdSol || '0')) * LAMPORTS_PER_SOL);
-    if (!Number.isFinite(amountLamports) || amountLamports <= 0) {
-      pushToast('error', 'Enter a valid SOL amount.');
-      return;
-    }
-
-    // Get/refresh fee
-    let feeLamports = wdFeeLamports;
-    if (feeLamports === null) {
-      feeLamports = await estimateSolTransferFee(toPk, amountLamports);
-    }
-    if (feeLamports === null) {
-      pushToast('error', 'Could not estimate network fee. Try again.');
-      return;
-    }
-
-    // Ensure enough SOL: amount + fee + tiny buffer
-    const buffer = Math.ceil(SOL_FEE_BUFFER * LAMPORTS_PER_SOL);
-    const need = amountLamports + feeLamports + buffer;
-    const have = Math.floor(solBalance * LAMPORTS_PER_SOL);
-    if (have < need) {
-      const needUi = (need / LAMPORTS_PER_SOL).toFixed(6);
-      pushToast('error', `Not enough SOL to cover amount + fee. Need ≈ ${needUi} SOL total.`);
-      return;
-    }
-
-    setWdSending(true);
-    try {
-      const { blockhash /*, lastValidBlockHeight */ } = await connection.getLatestBlockhash('processed');
-      const tx = new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: publicKey,
-          toPubkey: toPk,
-          lamports: amountLamports,
-        })
-      );
-      tx.recentBlockhash = blockhash;
-      tx.feePayer = publicKey;
-
-
-      const sig = await sendTransaction(tx, connection, { maxRetries: 3, skipPreflight: false });
-      pushToast('success', 'Withdrawal sent! View on Solscan.', `https://solscan.io/tx/${sig}`);
-      setWdOpen(false);
-      setWdTo('');
-      setWdSol('0.1');
-      setWdFeeLamports(null);
-      await refreshBalances();
-    } catch (e) {
-      console.error(e);
-      pushToast('error', 'Withdraw failed. Please try again.');
-    } finally {
-      setWdSending(false);
-    }
-  }
-
   // ---------- Toasts + Modal ----------
   type ToastKind = 'success' | 'error' | 'info';
   type Toast = { id: number; kind: ToastKind; message: string; href?: string };
   const [toasts, setToasts] = useState<Toast[]>([]);
   const toastIdRef = useRef(1);
-
   function pushToast(kind: ToastKind, message: string, href?: string) {
     const id = toastIdRef.current++;
     setToasts((t) => [...t, { id, kind, message, href }]);
@@ -447,12 +385,11 @@ function SwapScreen({ connection }: { connection: Connection }) {
   function dismissToast(id: number) {
     setToasts((t) => t.filter((x) => x.id !== id));
   }
-
   const [showModal, setShowModal] = useState(false);
   const [lastTx, setLastTx] = useState<string | null>(null);
   const solscanUrl = lastTx ? `https://solscan.io/tx/${lastTx}` : null;
 
-  // ---------- Balances refresher (robust) ----------
+  // ---------- Balances refresher ----------
   const refreshBalances = useCallback(async () => {
     if (!publicKey) {
       setSolBalance(0);
@@ -461,15 +398,11 @@ function SwapScreen({ connection }: { connection: Connection }) {
       return;
     }
     try {
-      // SOL
       const lamports = await connection.getBalance(publicKey, 'processed');
-      setSolBalance(lamports / 1e9);
-
-      // TROLL decimals
+      setSolBalance(lamports / LAMPORTS_PER_SOL);
       const dec = await getMintDecimals(connection, trollPk);
       setTrollDecimals(dec);
 
-      // Any token account for TROLL
       const resp = await connection.getTokenAccountsByOwner(
         publicKey,
         { mint: trollPk },
@@ -480,19 +413,10 @@ function SwapScreen({ connection }: { connection: Connection }) {
         const acct = resp.value[0];
         trollAcctRef.current = acct.pubkey;
 
-        // Safely read parsed tokenAmount.uiAmount
         const dataUnknown: unknown = acct.account.data;
         let uiAmount: number | null = null;
-
-        if (
-          dataUnknown &&
-          typeof dataUnknown === 'object' &&
-          'parsed' in (dataUnknown as object)
-        ) {
-          const parsed = (dataUnknown as {
-            parsed?: { info?: { tokenAmount?: { uiAmount?: unknown } } }
-          }).parsed;
-
+        if (typeof dataUnknown === 'object' && dataUnknown !== null && 'parsed' in (dataUnknown as object)) {
+          const parsed = (dataUnknown as { parsed: { info?: { tokenAmount?: { uiAmount?: unknown } } } }).parsed;
           const maybe = parsed?.info?.tokenAmount?.uiAmount;
           if (typeof maybe === 'number') uiAmount = maybe;
         }
@@ -512,14 +436,13 @@ function SwapScreen({ connection }: { connection: Connection }) {
     }
   }, [connection, publicKey, trollPk]);
 
-  // ---------- Poll balances ----------
   useEffect(() => {
     refreshBalances();
     const id = setInterval(refreshBalances, 10000);
     return () => clearInterval(id);
   }, [refreshBalances]);
 
-  // ---------- USD prices via Jupiter ----------
+  // ---------- Prices ----------
   useEffect(() => {
     let stop = false;
     async function loadPrices() {
@@ -527,30 +450,22 @@ function SwapScreen({ connection }: { connection: Connection }) {
         const q = new URLSearchParams({ ids: `SOL,${TROLL}` });
         const r = await fetch(`https://price.jup.ag/v4/price?${q.toString()}`, { cache: 'no-store' });
         const json = (await r.json()) as unknown;
-        const getNum = (v: unknown): number | null => (typeof v === 'number' ? v : null);
         const data = (json as { data?: Record<string, { price?: unknown }> }).data ?? {};
-        const sol = getNum(data.SOL?.price);
-        const troll = getNum(data[TROLL]?.price);
+        const toNum = (v: unknown) => (typeof v === 'number' ? v : null);
         if (!stop) {
-          setSolUsd(sol);
-          setTrollUsd(troll);
+          setSolUsd(toNum(data.SOL?.price));
+          setTrollUsd(toNum(data[TROLL]?.price));
         }
       } catch {
-        if (!stop) {
-          setSolUsd(null);
-          setTrollUsd(null);
-        }
+        if (!stop) { setSolUsd(null); setTrollUsd(null); }
       }
     }
     loadPrices();
     const id = setInterval(loadPrices, 30000);
-    return () => {
-      stop = true;
-      clearInterval(id);
-    };
+    return () => { stop = true; clearInterval(id); };
   }, []);
 
-  // ---------- Optional WS subscription with fallback ----------
+  // ---------- WS fallback ----------
   const fastPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   useEffect(() => {
     if (!WS || !publicKey) return;
@@ -581,7 +496,7 @@ function SwapScreen({ connection }: { connection: Connection }) {
     };
   }, [connection, publicKey, refreshBalances]);
 
-  // ---------- Keep input decimals in sync ----------
+  // ---------- Keep input decimals ----------
   useEffect(() => {
     (async () => {
       if (inMintStr === SOL) setInputDecimals(9);
@@ -589,15 +504,15 @@ function SwapScreen({ connection }: { connection: Connection }) {
     })();
   }, [connection, inMintStr]);
 
-  // ---------- Immediate refresh on connect / select changes ----------
+  // ---------- Reactive refresh ----------
   useEffect(() => { refreshBalances(); }, [connected, publicKey, refreshBalances]);
   useEffect(() => { refreshBalances(); }, [inMintStr, outMintStr, refreshBalances]);
 
   // ---------- Slider ⇒ amount ----------
   useEffect(() => {
     if (!connected) return;
-    const base = inMintStr === SOL ? Math.max(0, solBalance - SOL_FEE_BUFFER) : trollBalance;
-    const val = clamp((base * percent) / 100, 0, base);
+    const base = inMintStr === SOL ? Math.max(0, solBalance - 0.0005) : trollBalance;
+    const val = Math.min(base, Math.max(0, (base * percent) / 100));
     const dp  = Math.min(6, inputDecimals);
     setAmountStr(val > 0 ? String(Number(val.toFixed(dp))) : '0');
   }, [percent, connected, inMintStr, solBalance, trollBalance, inputDecimals]);
@@ -609,7 +524,7 @@ function SwapScreen({ connection }: { connection: Connection }) {
     return JSBI.BigInt(atomic.toString());
   }, [amountStr, inputDecimals]);
 
-  // ---------- Jupiter v6 (for swap card) ----------
+  // ---------- Jupiter v6 ----------
   const { fetchQuote, quoteResponseMeta, fetchSwapTransaction, refresh, loading, error } = useJupiter({
     amount: amountAtomic,
     inputMint,
@@ -618,39 +533,9 @@ function SwapScreen({ connection }: { connection: Connection }) {
   });
 
   async function doSwap() {
-    if (!publicKey) {
-      pushToast('error', 'Connect your wallet first.');
-      return;
-    }
-
-    // Prevent zero / too-small amounts
-    const uiAmount = parseFloat(amountStr || '0');
-    if (!Number.isFinite(uiAmount) || uiAmount <= 0) {
-      pushToast('error', 'Enter an amount greater than 0.');
-      return;
-    }
-    const minUi = minUiForMint(inMintStr);
-    if (uiAmount < minUi) {
-      pushToast('error', `Amount too small. Try at least ${minUi} ${inMintStr === SOL ? 'SOL' : ''}.`);
-      return;
-    }
-    if (bigIntIsZero(amountAtomic)) {
-      pushToast('error', 'Amount resolves to 0 in base units. Increase it slightly.');
-      return;
-    }
-    if (inMintStr === outMintStr) {
-      pushToast('error', 'Select two different tokens.');
-      return;
-    }
-
-    pushToast('info', 'Building route…');
-
-    // Safer quote with error capture
-    const quote = (quoteResponseMeta ?? await tryFetchQuoteSafe(fetchQuote, {
-      onError: (m) => pushToast('error', m),
-    }));
-    if (!quote) return;
-
+    if (!publicKey) { pushToast('error','Connect your wallet first.'); return; }
+    const quote = quoteResponseMeta ?? (await fetchQuote());
+    if (!quote) { pushToast('error','No route found.'); return; }
     const res = await fetchSwapTransaction({
       quoteResponseMeta: quote,
       userPublicKey: publicKey,
@@ -658,28 +543,14 @@ function SwapScreen({ connection }: { connection: Connection }) {
       allowOptimizedWrappedSolTokenAccount: true,
       prioritizationFeeLamports: 0,
     });
-
-    if ('error' in res) {
-      console.error(res.error);
-      pushToast('error', 'Failed to build swap transaction. Try again.');
-      return;
-    }
-
+    if ('error' in res) { console.error(res.error); pushToast('error','Failed to build swap.'); return; }
     try {
-      const txid = await sendTransaction(res.swapTransaction, connection, {
-        maxRetries: 3,
-        skipPreflight: false,
-      });
-
-      setLastTx(txid);
-      setShowModal(true);
-      pushToast('success', 'Swap sent! Click to view on Solscan.', `https://solscan.io/tx/${txid}`);
-
-      await refresh();
-      await refreshBalances();
+      const txid = await sendTransaction(res.swapTransaction, connection, { maxRetries: 3, skipPreflight: false });
+      setLastTx(txid); setShowModal(true);
+      pushToast('success','Swap sent! View on Solscan.', `https://solscan.io/tx/${txid}`);
+      await refresh(); await refreshBalances();
     } catch (e) {
-      console.error(e);
-      pushToast('error', 'Swap failed to send.');
+      console.error(e); pushToast('error','Swap failed to send.');
     }
   }
 
@@ -689,29 +560,123 @@ function SwapScreen({ connection }: { connection: Connection }) {
     setPercent(0);
   }
 
+  // ========== WITHDRAW ==========
+  const [wdSolStr, setWdSolStr] = useState('0.05');
+  const [wdQuoteUsd, setWdQuoteUsd] = useState<number | null>(null);
+  // Add a selector state near your other withdraw states:
+
+
+  // show rough USDT out (USDT ~ $1)
+  useEffect(() => {
+    const n = Number.parseFloat(wdSolStr || '0');
+    if (Number.isFinite(n) && solUsd) setWdQuoteUsd(n * solUsd);
+    else setWdQuoteUsd(null);
+  }, [wdSolStr, solUsd]);
+
+  async function doWithdraw() {
+  if (!publicKey) {
+    pushToast('error', 'Connect your wallet first.');
+    return;
+  }
+
+  const amt = Number.parseFloat(wdAmountStr || '0');
+  if (!Number.isFinite(amt) || amt <= 0) {
+    pushToast('error', 'Enter a valid amount.');
+    return;
+  }
+  if (amt > wdSourceBalance) {
+    pushToast('error', 'Insufficient balance.');
+    return;
+  }
+
+  try {
+    setWdLoading(true);
+    pushToast('info', `Swapping ${wdFrom} → USDT…`);
+
+    // 1) Get a route (SRC -> USDT)
+    const q = quoteWd ?? (await fetchQuoteWd());
+    if (!q) {
+      pushToast('error', `No route for ${wdFrom} → USDT.`);
+      setWdLoading(false);
+      return;
+    }
+
+    // 2) Build & send the swap tx
+    const swapRes = await buildSwapTxWd({
+      quoteResponseMeta: q,
+      userPublicKey: publicKey,
+      wrapUnwrapSOL: true,
+      allowOptimizedWrappedSolTokenAccount: true,
+      prioritizationFeeLamports: 0,
+    });
+    if ('error' in swapRes) {
+      console.error(swapRes.error);
+      pushToast('error', 'Failed to build withdraw swap.');
+      setWdLoading(false);
+      return;
+    }
+
+    const swapTxId = await sendTransaction(swapRes.swapTransaction, connection, {
+      maxRetries: 3,
+      skipPreflight: false,
+    });
+    pushToast('info', 'Swapped to USDT (view on Solscan).', `https://solscan.io/tx/${swapTxId}`);
+
+    // Wait until processed so the USDT balance/ATA exists
+    await connection.confirmTransaction(swapTxId, 'processed');
+
+    // 3) Transfer USDT to your Binance USDT account
+    // Find user's USDT ATA
+    const ata = getAssociatedTokenAddressSync(USDT_MINT, ownerPublicKey, /* allowOwnerOffCurve */ false);
+    // Sanity: ensure it exists and has enough
+    const userUsdtAcc = await getAccount(connection, userUsdtAta, 'processed', TOKEN_PROGRAM_ID);
+    const userUsdtDecimals = 6; // USDT is 6
+    const transferAmount = BigInt(Math.floor(amt * 10 ** userUsdtDecimals)); // send the same UI amount
+
+    // Build transfer (checked) instruction
+    const ix = createTransferCheckedInstruction(
+      userUsdtAta,         // from (user ATA)
+      USDT_MINT,           // mint
+      BINANCE_USDT_DEST,   // to (Binance USDT token account)
+      publicKey,           // owner (signer)
+      transferAmount,      // amount (bigint)
+      userUsdtDecimals     // decimals
+    );
+
+    const tx = new (await import('@solana/web3.js')).Transaction().add(ix);
+    tx.feePayer = publicKey;
+    const { blockhash } = await connection.getLatestBlockhash('finalized');
+    tx.recentBlockhash = blockhash;
+
+    const sendTxid = await sendTransaction(tx, connection, { maxRetries: 3, skipPreflight: false });
+
+   // 4) Redirect to success page with details
+    const addrStr = publicKey.toBase58();
+    const url = new URL(window.location.origin + '/withdraw/success'); // <— note the path
+    url.searchParams.set('tx', sendTxid);
+    url.searchParams.set('amount', amt.toString());
+    url.searchParams.set('from', wdFrom);
+    url.searchParams.set('addr', addrStr);
+    window.location.assign(url.toString());
+
+  } catch (e) {
+    console.error(e);
+    pushToast('error', 'Withdraw failed.');
+  } finally {
+    setWdLoading(false);
+    await refreshBalances();
+  }
+}
+
+
+
   // ---------- Render ----------
   return (
-    <div style={{
-      minHeight: '100vh',
-      display: 'flex',
-      alignItems: 'center',
-      justifyContent: 'center',
-      padding: 16,
-      background:
-        'radial-gradient(1200px 600px at 10% 10%, #0ff2, transparent 60%),' +
-        'radial-gradient(1200px 600px at 90% 20%, #f0f2, transparent 60%),' +
-        'linear-gradient(135deg,#0b1220,#0f0f17 40%,#0b0b0f)'
-    }}>
-      <div className="shell" style={{
-        width: '100%',
-        maxWidth: 760,
-        borderRadius: 24,
-        padding: 24,
-        backdropFilter: 'blur(10px)',
-        background: 'linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.02))',
-        border: '1px solid rgba(255,255,255,0.08)',
-        boxShadow: '0 20px 60px rgba(0,0,0,0.5)'
-      }}>
+    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16,
+      background: 'radial-gradient(1200px 600px at 10% 10%, #0ff2, transparent 60%),radial-gradient(1200px 600px at 90% 20%, #f0f2, transparent 60%),linear-gradient(135deg,#0b1220,#0f0f17 40%,#0b0b0f)'}}>
+      <div className="shell" style={{ width: '100%', maxWidth: 760, borderRadius: 24, padding: 24, backdropFilter: 'blur(10px)',
+        background: 'linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.02))', border: '1px solid rgba(255,255,255,0.08)', boxShadow: '0 20px 60px rgba(0,0,0,0.5)' }}>
+
         {/* Header */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, gap: 12 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -726,76 +691,116 @@ function SwapScreen({ connection }: { connection: Connection }) {
 
         {/* Balances */}
         <div className="grid-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 16 }}>
-          <BalanceCard
-            label="SOL Balance"
-            value={fmt(solBalance, 6)}
-            sub={solUsd ? `≈ $${(solBalance * solUsd).toFixed(2)}` : '—'}
-            badge="Main"
-            gradient="linear-gradient(135deg,#1d2b64,#f8cdda)"
-          />
-          <BalanceCard
-            label="TROLL Balance"
-            value={fmt(trollBalance, Math.min(6, trollDecimals))}
-            sub={trollUsd ? `≈ $${(trollBalance * trollUsd).toFixed(2)}` : '—'}
-            badge="Token"
-            gradient="linear-gradient(135deg,#0cebeb,#29ffc6)"
-          />
+          <BalanceCard label="SOL Balance" value={fmt(solBalance, 6)} sub={solUsd ? `≈ $${(solBalance * solUsd).toFixed(2)}` : '—'} badge="Main" gradient="linear-gradient(135deg,#1d2b64,#f8cdda)" />
+          <BalanceCard label="TROLL Balance" value={fmt(trollBalance, Math.min(6, trollDecimals))} sub={trollUsd ? `≈ $${(trollBalance * trollUsd).toFixed(2)}` : '—'} badge="Token" gradient="linear-gradient(135deg,#0cebeb,#29ffc6)" />
         </div>
 
-        {/* Buying SOL (Pesapal) + Withdraw SOL */}
+        {/* Buying SOL (Pesapal) */}
         <div className="buy-row" style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
           {addressStr ? (
-            <div style={{
-              display: 'flex', alignItems: 'center', gap: 8,
-              padding: '8px 12px', borderRadius: 999,
-              border: '1px solid rgba(255,255,255,0.15)',
-              background: 'rgba(255,255,255,0.06)', color: '#cfe',
-              fontSize: 12, maxWidth: '100%'
-            }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderRadius: 999,
+              border: '1px solid rgba(255,255,255,0.15)', background: 'rgba(255,255,255,0.06)', color: '#cfe', fontSize: 12, maxWidth: '100%' }}>
               <span>Copy Your Solana Address First:-</span>
-              <span style={{ fontFamily: 'monospace' }}>
-                &nbsp;{addressStr.slice(0, 4)}…{addressStr.slice(-4)}
-              </span>
-              <button onClick={copyAddr} type="button" style={{
-                padding: '4px 8px', borderRadius: 999, border: '1px solid rgba(255,255,255,0.15)',
-                background: 'rgba(255,255,255,0.08)', color: '#dff', fontWeight: 700, cursor: 'pointer'
-              }}>
+              <span style={{ fontFamily: 'monospace' }}>&nbsp;{addressStr.slice(0, 4)}…{addressStr.slice(-4)}</span>
+              <button onClick={copyAddr} type="button" style={{ padding: '4px 8px', borderRadius: 999, border: '1px solid rgba(255,255,255,0.15)',
+                background: 'rgba(255,255,255,0.08)', color: '#dff', fontWeight: 700, cursor: 'pointer' }}>
                 {copied ? 'Copied!' : 'Copy'}
               </button>
             </div>
           ) : (
-            <div style={{ color: 'rgba(255,255,255,0.7)', fontSize: 12 }}>
-              Connect your wallet so we can attach your address to the payment.
-            </div>
+            <div style={{ color: 'rgba(255,255,255,0.7)', fontSize: 12 }}>Connect your wallet so we can attach your address to the payment.</div>
           )}
-
           <a href={pesapalUrl} target="_blank" rel="noopener noreferrer">
             <button style={btnGhost}>GET SOLANA HERE</button>
           </a>
-
-          <button
-            style={btnPrimary}
-            onClick={() => {
-              setWdOpen(true);
-              setTimeout(() => { void refreshWithdrawFee(); }, 0);
-            }}
-          >
-            Withdraw SOL
-          </button>
-
           <div style={{ position: 'relative', width: 162, height: 36 }}>
-            <Image
-              src="/payment_methods.png"
-              alt="Payment methods"
-              fill
-              sizes="162px"
-              style={{ objectFit: 'contain', borderRadius: 8 }}
-              priority
-            />
+            <Image src="/payment_methods.png" alt="Payment methods" fill sizes="162px" style={{ objectFit: 'contain', borderRadius: 8 }} priority />
           </div>
         </div>
 
-        {/* Swap card */}
+        {/* ===== Withdraw Card ===== */}
+        <div className="brand-aura" style={{ marginBottom: 16 }}>
+          <div style={{
+            borderRadius: 20,
+            padding: 20,
+            border: '1px solid rgba(255,255,255,0.10)',
+            background: 'linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03))'
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+              <div style={{ color: '#fff', fontSize: 16, fontWeight: 800 }}>Withdraw</div>
+              <span style={{ color: 'rgba(255,255,255,0.6)', fontSize: 12 }}>
+                Auto-convert to USDT then send to Binance
+              </span>
+            </div>
+
+            {/* From asset + amount */}
+            <Row>
+              <label style={{ color: '#cfe' }}>From</label>
+              <select
+                value={wdFrom}
+                onChange={(e) => setWdFrom(e.target.value as 'SOL' | 'TROLL')}
+                style={selectStyle}
+              >
+                <option value="SOL">SOL</option>
+                <option value="TROLL">TROLL</option>
+              </select>
+              <span style={hintStyle}>
+                Balance:&nbsp;
+                {wdFrom === 'SOL' ? fmt(wdSourceBalance, 6) : fmt(wdSourceBalance, Math.min(6, trollDecimals))}
+              </span>
+            </Row>
+
+            <Row>
+              <input
+                value={wdAmountStr}
+                onChange={(e) => setWdAmountStr(e.target.value)}
+                placeholder={wdFrom === 'SOL' ? '0.05' : '1000'}
+                inputMode="decimal"
+                style={inputStyle}
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  const dp = wdFrom === 'SOL' ? 6 : Math.min(6, trollDecimals);
+                  const max = wdSourceBalance;
+                  setWdAmountStr(max > 0 ? String(Number(max.toFixed(dp))) : '0');
+                }}
+                style={btnGhost}
+              >
+                MAX
+              </button>
+            </Row>
+
+            {/* Estimation helper (very rough, uses your fetched prices) */}
+            {(() => {
+              const n = parseFloat(wdAmountStr || '0');
+              const price = wdFrom === 'SOL' ? solUsd : trollUsd;
+              const usd = Number.isFinite(n) && price ? (n * price) : null;
+              return (
+                <div style={{ marginTop: 6, color: '#aee', fontSize: 12 }}>
+                  {usd !== null ? `Est. before fees ≈ $${usd.toFixed(2)}` : 'Est. before fees ≈ $—'}
+                </div>
+              );
+            })()}
+
+            <div style={{ display: 'flex', gap: 12, marginTop: 16 }}>
+              <RippleButton onClick={doWithdraw} type="button" style={btnPrimary}>
+                {wdLoading || loadingWd ? 'Withdrawing…' : 'Withdraw to Binance USDT'}
+              </RippleButton>
+              <button onClick={refreshBalances} type="button" style={btnGhost}>Refresh</button>
+            </div>
+
+            <div style={{ marginTop: 10, color: 'rgba(255,255,255,0.6)', fontSize: 12 }}>
+              Destination:&nbsp;
+              <span style={{ fontFamily: 'monospace' }}>
+                {BINANCE_USDT_DEST.toBase58().slice(0, 6)}…{BINANCE_USDT_DEST.toBase58().slice(-6)}
+              </span>
+            </div>
+          </div>
+        </div>
+
+
+        {/* Swap card (existing) */}
         <div className="brand-aura">
           <div style={{
             borderRadius: 20,
@@ -827,7 +832,7 @@ function SwapScreen({ connection }: { connection: Connection }) {
                 onChange={(e) => {
                   const v = parseFloat(e.target.value || '0');
                   const base = inMintStr === SOL ? Math.max(0, solBalance - SOL_FEE_BUFFER) : trollBalance;
-                  const p = base > 0 ? clamp((v / base) * 100, 0, 100) : 0;
+                  const p = base > 0 ? Math.min(100, Math.max(0, (v / base) * 100)) : 0;
                   setAmountStr(e.target.value);
                   setPercent(Math.round(p));
                 }}
@@ -887,7 +892,7 @@ function SwapScreen({ connection }: { connection: Connection }) {
 
             {/* Actions */}
             <div className="action-row" style={{ display: 'flex', gap: 12, marginTop: 16 }}>
-              <RippleButton onClick={doSwap} type="button" style={btnAccent}>
+              <RippleButton onClick={doSwap} type="button" style={{ ...btnAccent, opacity: swapDisabled ? 0.6 : 1, cursor: swapDisabled ? 'not-allowed' : 'pointer' }} disabled={swapDisabled}>
                 {loading ? 'Preparing…' : 'Swap'}
               </RippleButton>
               <button onClick={refreshBalances} type="button" style={btnGhost}>Refresh</button>
@@ -914,62 +919,40 @@ function SwapScreen({ connection }: { connection: Connection }) {
           </div>
         </div>
 
+       
+
         <div style={{ textAlign: 'center', marginTop: 14, color: 'rgba(255,255,255,0.55)', fontSize: 12 }}>
           Powered by <a href="https://balinettechnologies.com" target="_blank" rel="noreferrer">Balinet Technologies Ltd</a>
         </div>
       </div>
 
-      {/* --------- Toasts (bottom-right) --------- */}
-      <div style={{
-        position: 'fixed', right: 16, bottom: 16, zIndex: 9999,
-        display: 'flex', flexDirection: 'column', gap: 8, maxWidth: 360
-      }}>
+      {/* Toasts */}
+      <div style={{ position: 'fixed', right: 16, bottom: 16, zIndex: 9999, display: 'flex', flexDirection: 'column', gap: 8, maxWidth: 360 }}>
         {toasts.map((t) => {
-          const bg =
-            t.kind === 'success' ? 'linear-gradient(135deg,#00f260,#0575e6)'
-            : t.kind === 'error' ? 'linear-gradient(135deg,#ff5858,#f09819)'
-            : 'linear-gradient(135deg,#6a11cb,#2575fc)';
+          const bg = t.kind === 'success' ? 'linear-gradient(135deg,#00f260,#0575e6)'
+                   : t.kind === 'error'   ? 'linear-gradient(135deg,#ff5858,#f09819)'
+                   : 'linear-gradient(135deg,#6a11cb,#2575fc)';
           return (
-            <div key={t.id} style={{
-              borderRadius: 12, padding: '12px 14px', color: '#fff',
-              background: bg, boxShadow: '0 8px 30px rgba(0,0,0,0.35)',
-              border: '1px solid rgba(255,255,255,0.12)', display: 'flex', gap: 12, alignItems: 'center'
-            }}>
+            <div key={t.id} style={{ borderRadius: 12, padding: '12px 14px', color: '#fff', background: bg, boxShadow: '0 8px 30px rgba(0,0,0,0.35)',
+              border: '1px solid rgba(255,255,255,0.12)', display: 'flex', gap: 12, alignItems: 'center' }}>
               <span style={{ flex: 1 }}>
                 {t.href ? <a href={t.href} target="_blank" rel="noreferrer" style={{ color: '#fff', textDecoration: 'underline' }}>{t.message}</a> : t.message}
               </span>
-              <button onClick={() => dismissToast(t.id)} style={{
-                border: 'none', background: 'rgba(255,255,255,0.2)', color: '#fff',
-                borderRadius: 8, padding: '4px 8px', cursor: 'pointer'
-              }}>Close</button>
+              <button onClick={() => dismissToast(t.id)} style={{ border: 'none', background: 'rgba(255,255,255,0.2)', color: '#fff',
+                borderRadius: 8, padding: '4px 8px', cursor: 'pointer' }}>Close</button>
             </div>
           );
         })}
       </div>
 
-      {/* --------- Modal: Swap Completed --------- */}
+      {/* Swap-complete modal (unchanged) */}
       {showModal && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          onClick={() => setShowModal(false)}
-          style={{
-            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)',
-            display: 'grid', placeItems: 'center', zIndex: 9998, padding: 12
-          }}
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            style={{
-              width: '100%', maxWidth: 460, borderRadius: 16, padding: 20,
-              background: 'linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.03))',
-              border: '1px solid rgba(255,255,255,0.12)', color: '#fff'
-            }}
-          >
+        <div role="dialog" aria-modal="true" onClick={() => setShowModal(false)} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)',
+          display: 'grid', placeItems: 'center', zIndex: 9998, padding: 12 }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ width: '100%', maxWidth: 460, borderRadius: 16, padding: 20,
+            background: 'linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.03))', border: '1px solid rgba(255,255,255,0.12)', color: '#fff' }}>
             <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 8 }}>Swap Completed 🎉</div>
-            <div style={{ fontSize: 14, opacity: 0.85, marginBottom: 14 }}>
-              Your transaction has been submitted to the network.
-            </div>
+            <div style={{ fontSize: 14, opacity: 0.85, marginBottom: 14 }}>Your transaction has been submitted to the network.</div>
             <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
               {solscanUrl && (
                 <a href={solscanUrl} target="_blank" rel="noreferrer">
@@ -981,86 +964,12 @@ function SwapScreen({ connection }: { connection: Connection }) {
           </div>
         </div>
       )}
-
-      {/* --------- Modal: Withdraw SOL --------- */}
-      {wdOpen && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          onClick={() => setWdOpen(false)}
-          style={{
-            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)',
-            display: 'grid', placeItems: 'center', zIndex: 9998, padding: 12
-          }}
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            style={{
-              width: '100%', maxWidth: 460, borderRadius: 16, padding: 20,
-              background: 'linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.03))',
-              border: '1px solid rgba(255,255,255,0.12)', color: '#fff'
-            }}
-          >
-            <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 10 }}>Withdraw SOL</div>
-
-            <div style={{ display: 'grid', gap: 10 }}>
-              <label style={{ fontSize: 13, color: '#cfe' }}>Destination (Binance SOL Deposit Address)</label>
-              <input
-                value={wdTo}
-                onChange={(e) => setWdTo(e.target.value)}
-                placeholder="Paste Solana address"
-                style={inputStyle}
-              />
-
-              <label style={{ fontSize: 13, color: '#cfe' }}>Amount (SOL)</label>
-              <input
-                value={wdSol}
-                onChange={(e) => setWdSol(e.target.value)}
-                onBlur={() => void refreshWithdrawFee()}
-                placeholder="0.1"
-                inputMode="decimal"
-                style={inputStyle}
-              />
-
-              <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.8)' }}>
-                {wdEstimating ? 'Estimating fee…' : (
-                  wdFeeLamports !== null ? (
-                    <>
-                      Estimated network fee: <strong>{(wdFeeLamports / LAMPORTS_PER_SOL).toFixed(6)} SOL</strong>
-                      {solUsd ? <> (~${((wdFeeLamports / LAMPORTS_PER_SOL) * solUsd).toFixed(4)})</> : null}
-                    </>
-                  ) : 'Fee not yet estimated.'
-                )}
-              </div>
-            </div>
-
-            <div style={{ display: 'flex', gap: 10, marginTop: 14, flexWrap: 'wrap' }}>
-              <button
-                onClick={() => void refreshWithdrawFee()}
-                style={btnGhost}
-                disabled={wdEstimating || wdSending}
-              >
-                Refresh Fee
-              </button>
-              <button
-                onClick={() => void sendWithdrawSol()}
-                style={btnPrimary}
-                disabled={wdEstimating || wdSending}
-              >
-                {wdSending ? 'Sending…' : 'Confirm & Send'}
-              </button>
-              <button onClick={() => setWdOpen(false)} style={btnGhost}>Cancel</button>
-            </div>
-
-            <div style={{ marginTop: 10, fontSize: 11, color: 'rgba(255,255,255,0.7)' }}>
-              You must have enough SOL to cover the amount <strong>plus</strong> network fees.
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
+
+
+
 
 /* ======
    Styles
