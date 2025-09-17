@@ -40,6 +40,7 @@ const SOL   = process.env.NEXT_PUBLIC_SOL_MINT!; // So1111...
 /* ===================
    Helpers & Constants
    =================== */
+const SOL_FEE_BUFFER = 0.004;
 const SOL_FEE_BUFFER = 0.004; // safety cushion for fees
 
 function clamp(n: number, min: number, max: number) {
