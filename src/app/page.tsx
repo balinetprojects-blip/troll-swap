@@ -989,7 +989,7 @@ function SwapScreen({ connection }: { connection: Connection }) {
           aria-modal="true"
           onClick={() => setWdOpen(false)}
           style={{
-            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)',
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(4px)',
             display: 'grid', placeItems: 'center', zIndex: 9998, padding: 12
           }}
         >
@@ -997,13 +997,13 @@ function SwapScreen({ connection }: { connection: Connection }) {
             onClick={(e) => e.stopPropagation()}
             style={{
               width: '100%', maxWidth: 460, borderRadius: 16, padding: 20,
-              background: 'linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.03))',
+              background: 'rgba(20, 20, 30, 0.95)', boxShadow: '0 12px 40px rgba(0,0,0,0.6)',
               border: '1px solid rgba(255,255,255,0.12)', color: '#fff'
             }}
           >
             <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 10 }}>Withdraw SOL</div>
 
-            <div style={{ display: 'grid', gap: 10 }}>
+            <div style={{ display: 'grid', gap: 14 }}>
               <label style={{ fontSize: 13, color: '#cfe' }}>Destination (Binance SOL Deposit Address)</label>
               <input
                 value={wdTo}
