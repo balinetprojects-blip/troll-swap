@@ -75,21 +75,30 @@ function minUiForMint(mintStr: string) {
   if (mintStr === SOL) return 0.0001; // ~0.0001 SOL
   return 0.1;                         // tokens default
 }
-async function tryFetchQuoteSafe(fetchQuote: () => Promise<any>, opts?: {
-  onError?: (msg: string) => void;
-}) {
+async function tryFetchQuoteSafe<T>(
+  fetchQuote: () => Promise<T>,
+  opts?: { onError?: (msg: string) => void }
+): Promise<T | null> {
   try {
     const q = await fetchQuote();
     return q ?? null;
-  } catch (e: any) {
-    const msg =
-      e?.response?.status
-        ? `Quote failed (HTTP ${e.response.status}). Try a slightly larger amount or retry.`
-        : `Quote failed: ${e?.message ?? 'Unknown error'}`;
+  } catch (e: unknown) {
+    let msg: string;
+
+    if (typeof e === "object" && e !== null && "response" in e) {
+      const err = e as { response?: { status?: number }; message?: string };
+      msg = err.response?.status
+        ? `Quote failed (HTTP ${err.response.status}). Try a slightly larger amount or retry.`
+        : `Quote failed: ${err.message ?? "Unknown error"}`;
+    } else {
+      msg = "Quote failed: Unknown error";
+    }
+
     opts?.onError?.(msg);
     return null;
   }
 }
+
 
 /* ============
    Global CSS
@@ -135,7 +144,7 @@ function Logo() {
   return (
     <>
       <div className="logoWrap logoAura">
-        <img
+        <Image
           src="/troll.png"
           alt="Troll Logo"
           className="logoImg"
