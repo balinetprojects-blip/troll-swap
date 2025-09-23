@@ -779,7 +779,7 @@ function SwapScreen({ connection }: { connection: Connection }) {
           )}
 
           <a href={pesapalUrl} target="_blank" rel="noopener noreferrer">
-            <button style={btnGhost}>GET SOLANA HERE</button>
+          <button style={btnPrimary}>Buy SOL</button>
           </a>
 
           <button
@@ -789,8 +789,9 @@ function SwapScreen({ connection }: { connection: Connection }) {
               setTimeout(() => { void refreshWithdrawFee(); }, 0);
             }}
           >
-            Withdraw SOL
+          Withdraw SOL
           </button>
+
 
           <div style={{ position: 'relative', width: 162, height: 36 }}>
             <Image
