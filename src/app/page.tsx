@@ -1018,7 +1018,7 @@ function SwapScreen({ connection }: { connection: Connection }) {
               <input
                 value={wdTo}
                 onChange={(e) => setWdTo(e.target.value)}
-                placeholder="Paste Solana address"
+                placeholder="Paste Binance Solana address"
                 style={inputStyle}
               />
 
