@@ -141,25 +141,36 @@ function GlobalStyles() {
    Components
    ========= */
 function Logo() {
+  const [broken, setBroken] = useState(false);
+
   return (
     <>
       <div className="logoWrap logoAura">
-        <Image
-          src="/troll.png"
-          alt="Troll Logo"
-          className="logoImg"
-          onError={(e) => {
-            const t = e.currentTarget as HTMLImageElement;
-            t.style.display = 'none';
-            const fb = document.createElement('div');
-            fb.textContent = 'T';
-            fb.style.cssText = `
-              width:100%;height:100%;display:grid;place-items:center;
-              color:#9ff;font-weight:900;font-size:20px;
-            `;
-            t.parentElement?.appendChild(fb);
-          }}
-        />
+        {broken ? (
+          <div
+            style={{
+              width: '100%',
+              height: '100%',
+              display: 'grid',
+              placeItems: 'center',
+              color: '#9ff',
+              fontWeight: 900,
+              fontSize: 20,
+            }}
+          >
+            T
+          </div>
+        ) : (
+          <Image
+            src="/troll.png"           // must be in /public/troll.png
+            alt="Troll Logo"
+            width={52}
+            height={52}
+            priority
+            className="logoImg"
+            onError={() => setBroken(true)}
+          />
+        )}
       </div>
 
       <style jsx>{`
@@ -188,6 +199,7 @@ function Logo() {
     </>
   );
 }
+
 
 type RBProps = React.ButtonHTMLAttributes<HTMLButtonElement>;
 function RippleButton({ children, onClick, style, disabled, className, ...rest }: RBProps) {
