@@ -72,32 +72,46 @@ function bigIntIsZero(x: JSBI) {
 }
 function minUiForMint(mintStr: string) {
   // set sane minimums to avoid “too small” quotes
-  if (mintStr === SOL) return 0.0001; // ~0.0001 SOL
-  return 0.1;                         // tokens default
+  if (mintStr === SOL) return 0.001; // ~0.0001 SOL
+  return 1;                         // tokens default
 }
-async function tryFetchQuoteSafe<T>(
-  fetchQuote: () => Promise<T>,
-  opts?: { onError?: (msg: string) => void }
-): Promise<T | null> {
-  try {
-    const q = await fetchQuote();
-    return q ?? null;
-  } catch (e: unknown) {
-    let msg: string;
 
-    if (typeof e === "object" && e !== null && "response" in e) {
-      const err = e as { response?: { status?: number }; message?: string };
-      msg = err.response?.status
-        ? `Quote failed (HTTP ${err.response.status}). Try a slightly larger amount or retry.`
-        : `Quote failed: ${err.message ?? "Unknown error"}`;
-    } else {
-      msg = "Quote failed: Unknown error";
+async function fetchQuoteWithRetry(
+  doFetch: () => Promise<any>,
+  tries = 3,
+  delayMs = 450
+) {
+  let lastErr: any = null;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const q = await doFetch();
+      if (q) return q;
+    } catch (e) {
+      lastErr = e;
     }
+    await new Promise(r => setTimeout(r, delayMs * (i + 1)));
+  }
+  throw lastErr ?? new Error('Quote failed after retries');
+}
 
+
+async function tryFetchQuoteSafe(fetcher: () => Promise<any>, opts?: { onError?: (msg: string) => void }) {
+  try {
+    const q = await fetcher();
+    return q ?? null;
+  } catch (e: any) {
+    // Jupiter often returns {response: {status, data: {error}}}
+    const status = e?.response?.status;
+    const serverMsg = e?.response?.data?.error || e?.response?.data?.message;
+    const msg = status
+      ? `Quote error (HTTP ${status})${serverMsg ? `: ${serverMsg}` : ''}.`
+      : `Quote error: ${e?.message ?? 'Unknown error'}`;
+    console.warn('[JUP QUOTE ERROR]', e);
     opts?.onError?.(msg);
     return null;
   }
 }
+
 
 
 /* ============
@@ -667,10 +681,14 @@ function SwapScreen({ connection }: { connection: Connection }) {
     pushToast('info', 'Building route…');
 
     // Safer quote with error capture
-    const quote = (quoteResponseMeta ?? await tryFetchQuoteSafe(fetchQuote, {
-      onError: (m) => pushToast('error', m),
-    }));
+    const quote = (quoteResponseMeta ??
+      await tryFetchQuoteSafe(
+        () => fetchQuoteWithRetry(fetchQuote),
+        { onError: (m) => pushToast('error', m) }
+      )
+    );
     if (!quote) return;
+
 
     const res = await fetchSwapTransaction({
       quoteResponseMeta: quote,
