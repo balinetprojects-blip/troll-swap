@@ -1,3 +1,5 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
 'use client';
 
 import dynamic from 'next/dynamic';
@@ -95,22 +97,46 @@ async function fetchQuoteWithRetry(
 }
 
 
-async function tryFetchQuoteSafe(fetcher: () => Promise<any>, opts?: { onError?: (msg: string) => void }) {
+async function tryFetchQuoteSafe<T>(
+  fetchQuote: () => Promise<T>,
+  opts?: { onError?: (msg: string) => void; context?: { input: string; output: string; amount: string } }
+) {
   try {
-    const q = await fetcher();
+    const q = await fetchQuote();
     return q ?? null;
   } catch (e: any) {
-    // Jupiter often returns {response: {status, data: {error}}}
-    const status = e?.response?.status;
-    const serverMsg = e?.response?.data?.error || e?.response?.data?.message;
-    const msg = status
-      ? `Quote error (HTTP ${status})${serverMsg ? `: ${serverMsg}` : ''}.`
-      : `Quote error: ${e?.message ?? 'Unknown error'}`;
-    console.warn('[JUP QUOTE ERROR]', e);
-    opts?.onError?.(msg);
+    // Best-effort detail extraction
+    let msg = 'Quote failed.';
+    let status: number | undefined;
+    let body: string | undefined;
+
+    // Some builds attach response on the error
+    if (e?.response) {
+      status = e.response.status;
+      try { body = await e.response.text(); } catch {}
+      msg = `Quote failed (HTTP ${status}).`;
+    } else if (e?.message) {
+      msg = `Quote failed: ${e.message}`;
+    }
+
+    // Console details for debugging
+    console.error('[Jupiter quote error]', {
+      status,
+      body,
+      context: opts?.context,
+      raw: e,
+    });
+
+    // Surface a user-friendly toast
+    opts?.onError?.(
+      status
+        ? `${msg} Try a slightly larger amount or different route.`
+        : `${msg} Please check your internet and try again.`
+    );
     return null;
   }
 }
+
 
 
 
@@ -681,13 +707,17 @@ function SwapScreen({ connection }: { connection: Connection }) {
     pushToast('info', 'Building route…');
 
     // Safer quote with error capture
-    const quote = (quoteResponseMeta ??
-      await tryFetchQuoteSafe(
-        () => fetchQuoteWithRetry(fetchQuote),
-        { onError: (m) => pushToast('error', m) }
-      )
-    );
-    if (!quote) return;
+   const atomicStr = amountAtomic.toString();
+const quote = (quoteResponseMeta ?? await tryFetchQuoteSafe(fetchQuote, {
+  onError: (m) => pushToast('error', m),
+  context: {
+    input: inputMint.toBase58(),
+    output: outputMint.toBase58(),
+    amount: atomicStr,
+  }
+}));
+if (!quote) return;
+
 
 
     const res = await fetchSwapTransaction({
