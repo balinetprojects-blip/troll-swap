@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer';
 import type { NextRequest } from 'next/server';
 
 const UPSTREAM_BASE = (process.env.JUPITER_UPSTREAM_URL ?? 'https://lite-api.jup.ag/swap/v1').replace(/\/$/, '');
@@ -54,19 +55,21 @@ async function proxy(
     const responseHeaders = new Headers(upstreamResponse.headers);
     applyCors(responseHeaders);
 
+    const payload = Buffer.from(await upstreamResponse.arrayBuffer());
+    responseHeaders.delete('content-encoding');
+    responseHeaders.delete('content-length');
+
     if (upstreamResponse.status >= 400) {
-      const errorBody = await upstreamResponse.text();
-      console.error('[jupiter-proxy]', upstreamResponse.status, errorBody);
-      responseHeaders.delete('content-encoding');
-      responseHeaders.delete('content-length');
-      return new Response(errorBody, {
+      const errorText = payload.toString('utf8');
+      console.error('[jupiter-proxy]', upstreamResponse.status, errorText);
+      return new Response(errorText, {
         status: upstreamResponse.status,
         statusText: upstreamResponse.statusText,
         headers: responseHeaders,
       });
     }
 
-    return new Response(upstreamResponse.body, {
+    return new Response(payload, {
       status: upstreamResponse.status,
       statusText: upstreamResponse.statusText,
       headers: responseHeaders,
