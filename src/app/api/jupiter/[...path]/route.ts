@@ -17,11 +17,13 @@ function applyCors(headers: Headers) {
   });
 }
 
+type RouteParams = { path?: string[] };
+
 async function proxy(
   request: NextRequest,
-  paramsPromise: Promise<any>
+  paramsPromise: Promise<RouteParams>
 ) {
-  const params = (await paramsPromise) as { path?: string[] };
+  const params = await paramsPromise;
   const segments = params?.path ?? [];
   const targetUrl = new URL(`${segments.join('/')}`, `${UPSTREAM_BASE}/`);
   request.nextUrl.searchParams.forEach((value, key) => {
@@ -79,16 +81,18 @@ async function proxy(
   }
 }
 
+type RouteContext = { params: Promise<RouteParams> };
+
 export async function GET(
   request: NextRequest,
-  context: { params: Promise<any> }
+  context: RouteContext
 ) {
   return proxy(request, context.params);
 }
 
 export async function POST(
   request: NextRequest,
-  context: { params: Promise<any> }
+  context: RouteContext
 ) {
   return proxy(request, context.params);
 }
