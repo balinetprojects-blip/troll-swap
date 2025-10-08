@@ -38,6 +38,67 @@ const RPC   = process.env.NEXT_PUBLIC_RPC_URL!;
 const WS    = process.env.NEXT_PUBLIC_WS_URL;
 const TROLL = process.env.NEXT_PUBLIC_TROLL_MINT!;
 const SOL   = process.env.NEXT_PUBLIC_SOL_MINT!; // So1111...
+const DEFAULT_QUOTE_BASE = '/api/jupiter';
+const REMOTE_QUOTE_BASE = 'https://lite-api.jup.ag/swap/v1';
+const JUPITER_QUOTE_API = (process.env.NEXT_PUBLIC_JUPITER_QUOTE_URL ?? DEFAULT_QUOTE_BASE).replace(/\/$/, '');
+const JUPITER_LEGACY_BASE = 'https://lite-api.jup.ag/swap/v1';
+
+function patchJupiterQuoteEndpoint() {
+  if (typeof window === 'undefined') return;
+
+  const w = window as typeof window & { __jupiterQuotePatched?: boolean };
+  if (w.__jupiterQuotePatched) return;
+
+  const legacy = JUPITER_LEGACY_BASE.replace(/\/$/, '');
+  const targetBase = (() => {
+    if (/^https?:\/\//i.test(JUPITER_QUOTE_API)) {
+      return JUPITER_QUOTE_API.replace(/\/$/, '');
+    }
+    return `${window.location.origin}${JUPITER_QUOTE_API}`.replace(/\/$/, '');
+  })();
+  const originalFetch = window.fetch.bind(window);
+
+  window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+    const rewrite = (url: string) => `${targetBase}${url.slice(legacy.length)}`;
+
+    if (typeof input === 'string' && input.startsWith(legacy)) {
+      const nextUrl = rewrite(input);
+      console.debug('[jupiter] rewrite fetch →', nextUrl);
+      return originalFetch(nextUrl, init);
+    }
+    if (input instanceof URL && input.href.startsWith(legacy)) {
+      const nextUrl = rewrite(input.href);
+      console.debug('[jupiter] rewrite fetch →', nextUrl);
+      return originalFetch(nextUrl, init);
+    }
+    if (typeof Request !== 'undefined' && input instanceof Request && input.url.startsWith(legacy)) {
+      const nextUrl = rewrite(input.url);
+      console.debug('[jupiter] rewrite fetch →', nextUrl);
+      const nextInit: RequestInit = init ?? {
+        method: input.method,
+        headers: input.headers,
+        credentials: input.credentials,
+        cache: input.cache,
+        redirect: input.redirect,
+        referrer: input.referrer,
+        referrerPolicy: input.referrerPolicy,
+        integrity: input.integrity,
+        mode: input.mode,
+        keepalive: input.keepalive,
+        signal: input.signal,
+      };
+      if (!nextInit.method) nextInit.method = input.method;
+      return originalFetch(nextUrl, nextInit);
+    }
+    return originalFetch(input as RequestInfo, init);
+  };
+
+  w.__jupiterQuotePatched = true;
+}
+
+if (typeof window !== 'undefined') {
+  patchJupiterQuoteEndpoint();
+}
 
 /* ===================
    Helpers & Constants
@@ -113,8 +174,20 @@ async function tryFetchQuoteSafe<T>(
     // Some builds attach response on the error
     if (e?.response) {
       status = e.response.status;
-      try { body = await e.response.text(); } catch {}
-      msg = `Quote failed (HTTP ${status}).`;
+      try {
+        body = await e.response.text();
+        let parsed: any = null;
+        if (body && body.trim().startsWith('{')) {
+          parsed = JSON.parse(body);
+        }
+        if (parsed?.errorCode || parsed?.error) {
+          msg = `Quote failed (${parsed.errorCode ?? parsed.error}).`;
+        } else {
+          msg = `Quote failed (HTTP ${status}).`;
+        }
+      } catch {
+        msg = `Quote failed (HTTP ${status}).`;
+      }
     } else if (e?.message) {
       msg = `Quote failed: ${e.message}`;
     }
@@ -312,6 +385,10 @@ function BalanceCard({
    Default export
    ============== */
 export default function Page() {
+  useEffect(() => {
+    patchJupiterQuoteEndpoint();
+  }, []);
+
   const connection = useMemo(
     () => new Connection(RPC, { wsEndpoint: WS || undefined, commitment: 'processed' }),
     []
@@ -319,7 +396,10 @@ export default function Page() {
   return (
     <>
       <GlobalStyles />
-      <JupiterProvider connection={connection}>
+      <JupiterProvider
+        connection={connection}
+        jupiterQuoteApiUrl={JUPITER_QUOTE_API}
+      >
         <SwapScreen connection={connection} />
       </JupiterProvider>
     </>
