@@ -39,7 +39,6 @@ const WS    = process.env.NEXT_PUBLIC_WS_URL;
 const TROLL = process.env.NEXT_PUBLIC_TROLL_MINT!;
 const SOL   = process.env.NEXT_PUBLIC_SOL_MINT!; // So1111...
 const DEFAULT_QUOTE_BASE = '/api/jupiter';
-const REMOTE_QUOTE_BASE = 'https://lite-api.jup.ag/swap/v1';
 const JUPITER_QUOTE_API = (process.env.NEXT_PUBLIC_JUPITER_QUOTE_URL ?? DEFAULT_QUOTE_BASE).replace(/\/$/, '');
 const JUPITER_LEGACY_BASE = 'https://lite-api.jup.ag/swap/v1';
 
@@ -138,25 +137,6 @@ function minUiForMint(mintStr: string) {
   if (mintStr === SOL) return 0.001; // ~0.0001 SOL
   return 1;                         // tokens default
 }
-
-async function fetchQuoteWithRetry(
-  doFetch: () => Promise<any>,
-  tries = 3,
-  delayMs = 450
-) {
-  let lastErr: any = null;
-  for (let i = 0; i < tries; i++) {
-    try {
-      const q = await doFetch();
-      if (q) return q;
-    } catch (e) {
-      lastErr = e;
-    }
-    await new Promise(r => setTimeout(r, delayMs * (i + 1)));
-  }
-  throw lastErr ?? new Error('Quote failed after retries');
-}
-
 
 async function tryFetchQuoteSafe<T>(
   fetchQuote: () => Promise<T>,

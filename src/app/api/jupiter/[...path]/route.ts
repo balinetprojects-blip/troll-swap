@@ -19,9 +19,9 @@ function applyCors(headers: Headers) {
 
 async function proxy(
   request: NextRequest,
-  paramsPromise: Promise<{ path?: string[] }> | { path?: string[] }
+  paramsPromise: Promise<any>
 ) {
-  const params = await paramsPromise;
+  const params = (await paramsPromise) as { path?: string[] };
   const segments = params?.path ?? [];
   const targetUrl = new URL(`${segments.join('/')}`, `${UPSTREAM_BASE}/`);
   request.nextUrl.searchParams.forEach((value, key) => {
@@ -81,14 +81,14 @@ async function proxy(
 
 export async function GET(
   request: NextRequest,
-  context: { params: Promise<{ path?: string[] }> | { path?: string[] } }
+  context: { params: Promise<any> }
 ) {
   return proxy(request, context.params);
 }
 
 export async function POST(
   request: NextRequest,
-  context: { params: Promise<{ path?: string[] }> | { path?: string[] } }
+  context: { params: Promise<any> }
 ) {
   return proxy(request, context.params);
 }
