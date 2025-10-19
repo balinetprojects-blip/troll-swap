@@ -484,7 +484,7 @@ function SwapScreen({ connection }: { connection: Connection }) {
   );
 
   // ---------- Amount / slider ----------
-  const [amountStr, setAmountStr] = useState<string>('0.1');
+  const [amountStr, setAmountStr] = useState<string>('');
   const [percent, setPercent]     = useState<number>(0);
 
   // ---------- Decimals + balances ----------
