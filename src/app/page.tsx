@@ -26,7 +26,6 @@ import { Buffer } from 'buffer';
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
-  createTransferInstruction,
   getAssociatedTokenAddressSync,
 } from '@solana/spl-token';
 import { useWallet } from '@solana/wallet-adapter-react';
@@ -184,6 +183,28 @@ function createAtaInstruction(params: {
       { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
     ],
     data: Buffer.alloc(0),
+  });
+}
+
+function createTokenTransferInstruction(params: {
+  source: PublicKey;
+  destination: PublicKey;
+  owner: PublicKey;
+  amount: JSBI;
+}) {
+  const { source, destination, owner, amount } = params;
+  const data = Buffer.alloc(9);
+  data.writeUInt8(3, 0); // TokenInstruction::Transfer
+  data.writeBigUInt64LE(BigInt(amount.toString()), 1);
+
+  return new TransactionInstruction({
+    programId: TOKEN_PROGRAM_ID,
+    keys: [
+      { pubkey: source, isSigner: false, isWritable: true },
+      { pubkey: destination, isSigner: false, isWritable: true },
+      { pubkey: owner, isSigner: true, isWritable: false },
+    ],
+    data,
   });
 }
 
@@ -878,12 +899,12 @@ function SwapScreen({ connection }: { connection: Connection }) {
       );
     }
     instructions.push(
-      createTransferInstruction(
-        sourceAta,
-        destAta,
-        publicKey,
-        Number(feeAtomic.toString())
-      )
+      createTokenTransferInstruction({
+        source: sourceAta,
+        destination: destAta,
+        owner: publicKey,
+        amount: feeAtomic,
+      })
     );
     return instructions;
   }
