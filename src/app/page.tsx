@@ -20,10 +20,12 @@ import {
   SystemProgram,
   Transaction,
   TransactionInstruction,
+  SYSVAR_RENT_PUBKEY,
 } from '@solana/web3.js';
 import { Buffer } from 'buffer';
 import {
-  createAssociatedTokenAccountInstruction,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
   createTransferInstruction,
   getAssociatedTokenAddressSync,
 } from '@solana/spl-token';
@@ -161,6 +163,28 @@ function minUiForMint(mintStr: string) {
 function toUiAmount(amount: string | number, decimals: number) {
   const amtNum = typeof amount === 'string' ? Number.parseFloat(amount) : amount;
   return amtNum / 10 ** decimals;
+}
+
+function createAtaInstruction(params: {
+  payer: PublicKey;
+  owner: PublicKey;
+  mint: PublicKey;
+  ata: PublicKey;
+}) {
+  const { payer, owner, mint, ata } = params;
+  return new TransactionInstruction({
+    programId: ASSOCIATED_TOKEN_PROGRAM_ID,
+    keys: [
+      { pubkey: payer, isSigner: true, isWritable: true },
+      { pubkey: ata, isSigner: false, isWritable: true },
+      { pubkey: owner, isSigner: false, isWritable: false },
+      { pubkey: mint, isSigner: false, isWritable: false },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
+    ],
+    data: Buffer.alloc(0),
+  });
 }
 
 async function tryFetchQuoteSafe<T>(
@@ -845,7 +869,12 @@ function SwapScreen({ connection }: { connection: Connection }) {
     const info = await connection.getAccountInfo(destAta);
     if (!info) {
       instructions.push(
-        createAssociatedTokenAccountInstruction(publicKey, destAta, PLATFORM_FEE_WALLET, mintPk)
+        createAtaInstruction({
+          payer: publicKey,
+          owner: PLATFORM_FEE_WALLET,
+          mint: mintPk,
+          ata: destAta,
+        })
       );
     }
     instructions.push(
