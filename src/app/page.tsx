@@ -19,9 +19,22 @@ import {
   PublicKey,
   SystemProgram,
   Transaction,
+  TransactionInstruction,
 } from '@solana/web3.js';
+import { Buffer } from 'buffer';
+import {
+  createAssociatedTokenAccountInstruction,
+  createTransferInstruction,
+  getAssociatedTokenAddressSync,
+} from '@solana/spl-token';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { JupiterProvider, useJupiter } from '@jup-ag/react-hook';
+import {
+  fetchRaydiumPriorityFee,
+  fetchRaydiumQuote,
+  fetchRaydiumSwapTransactions,
+  type RaydiumQuoteResponse,
+} from './lib/raydium';
 
 /* =========================
    Client-only wallet button
@@ -41,6 +54,9 @@ const SOL   = process.env.NEXT_PUBLIC_SOL_MINT!; // So1111...
 const DEFAULT_QUOTE_BASE = '/api/jupiter';
 const JUPITER_QUOTE_API = (process.env.NEXT_PUBLIC_JUPITER_QUOTE_URL ?? DEFAULT_QUOTE_BASE).replace(/\/$/, '');
 const JUPITER_LEGACY_BASE = 'https://lite-api.jup.ag/swap/v1';
+const RAYDIUM_SLIPPAGE_BPS = 300; // 3% fallback tolerance
+const PLATFORM_FEE_BPS = 50;      // 0.50% platform fee
+const PLATFORM_FEE_WALLET = new PublicKey('7hGZkFdTd6nwHxKSRwkgeUpvcpDgyrsDceF1Y2ip9SNC');
 
 function patchJupiterQuoteEndpoint() {
   if (typeof window === 'undefined') return;
@@ -107,6 +123,11 @@ const SOL_FEE_BUFFER = 0.004; // safety cushion for fees
 function clamp(n: number, min: number, max: number) {
   return Math.min(max, Math.max(min, n));
 }
+const TEN_THOUSAND = JSBI.BigInt(10000);
+function computeFeeAtomic(amount: JSBI, bps: number) {
+  if (bps <= 0) return JSBI.BigInt(0);
+  return JSBI.divide(JSBI.multiply(amount, JSBI.BigInt(bps)), TEN_THOUSAND);
+}
 function fmt(n: number, dp = 6) {
   return Number.isFinite(n) ? n.toFixed(dp) : '0';
 }
@@ -136,6 +157,10 @@ function minUiForMint(mintStr: string) {
   // set sane minimums to avoid “too small” quotes
   if (mintStr === SOL) return 0.001; // ~0.0001 SOL
   return 1;                         // tokens default
+}
+function toUiAmount(amount: string | number, decimals: number) {
+  const amtNum = typeof amount === 'string' ? Number.parseFloat(amount) : amount;
+  return amtNum / 10 ** decimals;
 }
 
 async function tryFetchQuoteSafe<T>(
@@ -402,6 +427,12 @@ function SwapScreen({ connection }: { connection: Connection }) {
   const inputMint  = useMemo(() => new PublicKey(inMintStr),  [inMintStr]);
   const outputMint = useMemo(() => new PublicKey(outMintStr), [outMintStr]);
   const trollPk    = useMemo(() => new PublicKey(TROLL), []);
+  const isRaydiumPair = useMemo(
+    () =>
+      (inMintStr === SOL && outMintStr === TROLL) ||
+      (inMintStr === TROLL && outMintStr === SOL),
+    [inMintStr, outMintStr]
+  );
 
   // ---------- Amount / slider ----------
   const [amountStr, setAmountStr] = useState<string>('0.1');
@@ -412,6 +443,9 @@ function SwapScreen({ connection }: { connection: Connection }) {
   const [solBalance, setSolBalance]       = useState<number>(0);
   const [trollBalance, setTrollBalance]   = useState<number>(0);
   const [trollDecimals, setTrollDecimals] = useState<number>(9);
+  const [raydiumQuote, setRaydiumQuote]   = useState<RaydiumQuoteResponse | null>(null);
+  const [raydiumQuoteLoading, setRaydiumQuoteLoading] = useState<boolean>(false);
+  const [raydiumQuoteError, setRaydiumQuoteError] = useState<string | null>(null);
 
   // ---------- USD prices ----------
   const [solUsd, setSolUsd]       = useState<number | null>(null);
@@ -730,6 +764,58 @@ function SwapScreen({ connection }: { connection: Connection }) {
     return JSBI.BigInt(atomic.toString());
   }, [amountStr, inputDecimals]);
 
+  useEffect(() => {
+    if (!isRaydiumPair) {
+      setRaydiumQuote(null);
+      setRaydiumQuoteError(null);
+      setRaydiumQuoteLoading(false);
+      return;
+    }
+    if (bigIntIsZero(amountAtomic)) {
+      setRaydiumQuote(null);
+      setRaydiumQuoteError(null);
+      return;
+    }
+    const feeAtomic = computeFeeAtomic(amountAtomic, PLATFORM_FEE_BPS);
+    const amountForSwap = JSBI.subtract(amountAtomic, feeAtomic);
+    if (JSBI.lessThanOrEqual(amountForSwap, JSBI.BigInt(0))) {
+      setRaydiumQuote(null);
+      setRaydiumQuoteError('Amount too small after platform fee.');
+      return;
+    }
+    let aborted = false;
+    setRaydiumQuoteLoading(true);
+    fetchRaydiumQuote({
+      inputMint: inMintStr,
+      outputMint: outMintStr,
+      amount: amountForSwap.toString(),
+      slippageBps: RAYDIUM_SLIPPAGE_BPS,
+      txVersion: 'LEGACY',
+    })
+      .then((res) => {
+        if (aborted) return;
+        if (!res.success) {
+          setRaydiumQuote(null);
+          setRaydiumQuoteError('Raydium quote unavailable.');
+        } else {
+          setRaydiumQuote(res);
+          setRaydiumQuoteError(null);
+        }
+      })
+      .catch((err: unknown) => {
+        if (aborted) return;
+        const msg = err instanceof Error ? err.message : 'Raydium quote failed.';
+        setRaydiumQuote(null);
+        setRaydiumQuoteError(msg);
+      })
+      .finally(() => {
+        if (!aborted) setRaydiumQuoteLoading(false);
+      });
+    return () => {
+      aborted = true;
+    };
+  }, [amountAtomic, inMintStr, outMintStr, isRaydiumPair]);
+
   // ---------- Jupiter v6 (for swap card) ----------
   const { fetchQuote, quoteResponseMeta, fetchSwapTransaction, refresh, loading, error } = useJupiter({
     amount: amountAtomic,
@@ -737,6 +823,167 @@ function SwapScreen({ connection }: { connection: Connection }) {
     outputMint,
     slippageBps: 50,
   });
+
+  async function buildPlatformFeeInstructions(feeAtomic: JSBI): Promise<TransactionInstruction[]> {
+    if (JSBI.lessThanOrEqual(feeAtomic, JSBI.BigInt(0))) return [];
+    if (!publicKey) return [];
+
+    if (inMintStr === SOL) {
+      return [
+        SystemProgram.transfer({
+          fromPubkey: publicKey,
+          toPubkey: PLATFORM_FEE_WALLET,
+          lamports: Number(feeAtomic.toString()),
+        }),
+      ];
+    }
+
+    const mintPk = new PublicKey(inMintStr);
+    const sourceAta = getAssociatedTokenAddressSync(mintPk, publicKey);
+    const destAta = getAssociatedTokenAddressSync(mintPk, PLATFORM_FEE_WALLET);
+    const instructions: TransactionInstruction[] = [];
+    const info = await connection.getAccountInfo(destAta);
+    if (!info) {
+      instructions.push(
+        createAssociatedTokenAccountInstruction(publicKey, destAta, PLATFORM_FEE_WALLET, mintPk)
+      );
+    }
+    instructions.push(
+      createTransferInstruction(
+        sourceAta,
+        destAta,
+        publicKey,
+        Number(feeAtomic.toString())
+      )
+    );
+    return instructions;
+  }
+
+  async function handleRaydiumSwap() {
+    if (!publicKey) return;
+    try {
+      const feeAtomic = computeFeeAtomic(amountAtomic, PLATFORM_FEE_BPS);
+      const swapAmount = JSBI.subtract(amountAtomic, feeAtomic);
+      if (JSBI.lessThanOrEqual(swapAmount, JSBI.BigInt(0))) {
+        pushToast('error', 'Amount too small after platform fee.');
+        return;
+      }
+
+      pushToast('info', 'Building Raydium route…');
+
+      let quote = raydiumQuote;
+      if (!quote || quote.data.inputAmount !== swapAmount.toString()) {
+        const freshQuote = await fetchRaydiumQuote({
+          inputMint: inMintStr,
+          outputMint: outMintStr,
+          amount: swapAmount.toString(),
+          slippageBps: RAYDIUM_SLIPPAGE_BPS,
+          txVersion: 'LEGACY',
+        });
+        if (!freshQuote.success) {
+          pushToast('error', 'Raydium quote unavailable.');
+          return;
+        }
+        quote = freshQuote;
+        setRaydiumQuote(freshQuote);
+        setRaydiumQuoteError(null);
+      }
+
+      const priorityFeeRes = await fetchRaydiumPriorityFee();
+      const priorityFee =
+        (priorityFeeRes.success && priorityFeeRes.data.default.h) ??
+        priorityFeeRes.data.default.m ??
+        15000;
+
+      const wrapSol = inMintStr === SOL;
+      const unwrapSol = outMintStr === SOL;
+      const txVersion = 'LEGACY' as const;
+      const inputAccount = wrapSol
+        ? undefined
+        : getAssociatedTokenAddressSync(new PublicKey(inMintStr), publicKey).toBase58();
+      const outputAccount = unwrapSol
+        ? undefined
+        : getAssociatedTokenAddressSync(new PublicKey(outMintStr), publicKey).toBase58();
+
+      const swapTx = await fetchRaydiumSwapTransactions({
+        swapResponse: quote,
+        wallet: publicKey,
+        txVersion,
+        computeUnitPriceMicroLamports: String(priorityFee),
+        wrapSol,
+        unwrapSol,
+        inputAccount,
+        outputAccount,
+      });
+
+      if (!swapTx.success || !swapTx.data?.length) {
+        pushToast('error', swapTx.msg ?? 'Failed to build Raydium swap.');
+        return;
+      }
+
+      const feeInstructions = await buildPlatformFeeInstructions(feeAtomic);
+      let lastSignature: string | null = null;
+
+      for (let i = 0; i < swapTx.data.length; i += 1) {
+        const raw = swapTx.data[i];
+        const tx = Transaction.from(Buffer.from(raw.transaction, 'base64'));
+        if (!tx.feePayer) tx.feePayer = publicKey;
+        if (i === 0 && feeInstructions.length) {
+          tx.instructions.unshift(...feeInstructions);
+        }
+        const sig = await sendTransaction(tx, connection, { skipPreflight: false });
+        lastSignature = sig;
+      }
+
+      if (lastSignature) {
+        setLastTx(lastSignature);
+        setShowModal(true);
+        pushToast(
+          'success',
+          'Swap sent via Raydium! Click to view on Solscan.',
+          `https://solscan.io/tx/${lastSignature}`
+        );
+        await refreshBalances();
+      }
+    } catch (err) {
+      console.error(err);
+      const msg = err instanceof Error ? err.message : 'Raydium swap failed.';
+      pushToast('error', msg);
+    }
+  }
+
+  const priceImpactValue = useMemo(() => {
+    if (isRaydiumPair) {
+      return raydiumQuote?.data?.priceImpactPct ?? null;
+    }
+    if (quoteResponseMeta?.quoteResponse?.priceImpactPct) {
+      return parseFloat(quoteResponseMeta.quoteResponse.priceImpactPct) * 100;
+    }
+    return null;
+  }, [isRaydiumPair, raydiumQuote, quoteResponseMeta]);
+
+  const priceImpactTint = useMemo(() => {
+    if (priceImpactValue === null) return 'rgba(255,255,255,0.6)';
+    if (priceImpactValue < 1) return '#8ef7c0';
+    if (priceImpactValue < 3) return '#ffd37a';
+    return '#ff9aa2';
+  }, [priceImpactValue]);
+
+  const estimatedRaydiumOutput = useMemo(() => {
+    if (!isRaydiumPair || !raydiumQuote?.data) return null;
+    const decimals = outMintStr === SOL ? 9 : Math.min(9, trollDecimals);
+    return toUiAmount(raydiumQuote.data.outputAmount, decimals);
+  }, [isRaydiumPair, raydiumQuote, outMintStr, trollDecimals]);
+
+  const swapButtonLoading = isRaydiumPair ? raydiumQuoteLoading : loading;
+  const outputDisplayDecimals = useMemo(
+    () => (outMintStr === SOL ? 6 : Math.min(6, trollDecimals)),
+    [outMintStr, trollDecimals]
+  );
+  const platformFeeAddressShort = useMemo(() => {
+    const addr = PLATFORM_FEE_WALLET.toBase58();
+    return `${addr.slice(0, 4)}…${addr.slice(-4)}`;
+  }, []);
 
   async function doSwap() {
     if (!publicKey) {
@@ -761,6 +1008,11 @@ function SwapScreen({ connection }: { connection: Connection }) {
     }
     if (inMintStr === outMintStr) {
       pushToast('error', 'Select two different tokens.');
+      return;
+    }
+
+    if (isRaydiumPair) {
+      await handleRaydiumSwap();
       return;
     }
 
@@ -1018,29 +1270,39 @@ if (!quote) return;
             {/* Actions */}
             <div className="action-row" style={{ display: 'flex', gap: 12, marginTop: 16 }}>
               <RippleButton onClick={doSwap} type="button" style={btnAccent}>
-                {loading ? 'Preparing…' : 'Swap'}
+                {swapButtonLoading ? 'Preparing…' : 'Swap'}
               </RippleButton>
               <button onClick={refreshBalances} type="button" style={btnGhost}>Refresh</button>
             </div>
 
             {/* Route info */}
-            {quoteResponseMeta && (() => {
-              const pip = quoteResponseMeta?.quoteResponse?.priceImpactPct
-                ? parseFloat(quoteResponseMeta.quoteResponse.priceImpactPct) * 100
-                : null;
-              const tint =
-                pip === null ? 'rgba(255,255,255,0.6)' :
-                pip < 1 ? '#8ef7c0' :
-                pip < 3 ? '#ffd37a' :
-                '#ff9aa2';
-              return (
-                <div style={{ marginTop: 12, fontSize: 13, color: tint }}>
-                  Price impact: {pip !== null ? `${pip.toFixed(2)}%` : '—'}
-                </div>
-              );
-            })()}
+            {priceImpactValue !== null ? (
+              <div style={{ marginTop: 12, fontSize: 13, color: priceImpactTint }}>
+                Price impact: {priceImpactValue.toFixed(2)}%
+              </div>
+            ) : null}
 
-            {error && <div style={{ color: '#ff9aa2', marginTop: 8 }}>Error: {String(error)}</div>}
+            {isRaydiumPair && estimatedRaydiumOutput !== null ? (
+              <div style={{ marginTop: 6, fontSize: 13, color: 'rgba(255,255,255,0.7)' }}>
+                Est. received:&nbsp;
+                {estimatedRaydiumOutput.toFixed(outputDisplayDecimals)}&nbsp;
+                {outMintStr === SOL ? 'SOL' : 'TROLL'}
+              </div>
+            ) : null}
+            {isRaydiumPair ? (
+              <div style={{ marginTop: 6, fontSize: 12, color: 'rgba(255,255,255,0.6)' }}>
+                Includes {(PLATFORM_FEE_BPS / 100).toFixed(2)}% platform fee → {platformFeeAddressShort}
+              </div>
+            ) : null}
+
+            {!isRaydiumPair && error && (
+              <div style={{ color: '#ff9aa2', marginTop: 8 }}>Error: {String(error)}</div>
+            )}
+            {isRaydiumPair && raydiumQuoteError && (
+              <div style={{ color: '#ff9aa2', marginTop: 8 }}>
+                Raydium error: {raydiumQuoteError}
+              </div>
+            )}
           </div>
         </div>
 
