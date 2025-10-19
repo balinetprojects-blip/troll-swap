@@ -23,11 +23,7 @@ import {
   SYSVAR_RENT_PUBKEY,
 } from '@solana/web3.js';
 import { Buffer } from 'buffer';
-import {
-  ASSOCIATED_TOKEN_PROGRAM_ID,
-  TOKEN_PROGRAM_ID,
-  getAssociatedTokenAddressSync,
-} from '@solana/spl-token';
+import { ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { JupiterProvider, useJupiter } from '@jup-ag/react-hook';
 import {
@@ -206,6 +202,14 @@ function createTokenTransferInstruction(params: {
     ],
     data,
   });
+}
+
+function deriveAta(mint: PublicKey, owner: PublicKey) {
+  const [ata] = PublicKey.findProgramAddressSync(
+    [owner.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
+    ASSOCIATED_TOKEN_PROGRAM_ID
+  );
+  return ata;
 }
 
 async function tryFetchQuoteSafe<T>(
@@ -884,8 +888,8 @@ function SwapScreen({ connection }: { connection: Connection }) {
     }
 
     const mintPk = new PublicKey(inMintStr);
-    const sourceAta = getAssociatedTokenAddressSync(mintPk, publicKey);
-    const destAta = getAssociatedTokenAddressSync(mintPk, PLATFORM_FEE_WALLET);
+    const sourceAta = deriveAta(mintPk, publicKey);
+    const destAta = deriveAta(mintPk, PLATFORM_FEE_WALLET);
     const instructions: TransactionInstruction[] = [];
     const info = await connection.getAccountInfo(destAta);
     if (!info) {
@@ -948,12 +952,8 @@ function SwapScreen({ connection }: { connection: Connection }) {
       const wrapSol = inMintStr === SOL;
       const unwrapSol = outMintStr === SOL;
       const txVersion = 'LEGACY' as const;
-      const inputAccount = wrapSol
-        ? undefined
-        : getAssociatedTokenAddressSync(new PublicKey(inMintStr), publicKey).toBase58();
-      const outputAccount = unwrapSol
-        ? undefined
-        : getAssociatedTokenAddressSync(new PublicKey(outMintStr), publicKey).toBase58();
+      const inputAccount = wrapSol ? undefined : deriveAta(new PublicKey(inMintStr), publicKey).toBase58();
+      const outputAccount = unwrapSol ? undefined : deriveAta(new PublicKey(outMintStr), publicKey).toBase58();
 
       const swapTx = await fetchRaydiumSwapTransactions({
         swapResponse: quote,
